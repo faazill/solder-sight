@@ -13,8 +13,9 @@ from google import genai
 from google.genai import types
 
 APP_NAME = "SolderSight"
-DEFAULT_MODEL = "gemini-2.5-flash"
-FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
+DEFAULT_MODEL = "gemini-flash-latest"
+# Used only if model discovery is unavailable. The live model list is preferred.
+FALLBACK_MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"]
 MAX_DIMENSION = 1400
 JPEG_QUALITY = 82
 MAX_RETRIES = 3
@@ -74,11 +75,11 @@ with st.sidebar:
     st.caption("Configure your inspection session.")
     source = st.radio("Image source", ["Upload image", "Live camera"], horizontal=False)
     model_name = st.text_input(
-        "Primary vision model",
+        "Model ID (manual override)",
         value=os.environ.get("SOLDERSIGHT_MODEL", DEFAULT_MODEL),
-        help="Use an image-capable Gemini model enabled for your API project."
+        help="Use Discover available models below to see models enabled for this API key."
     ).strip() or DEFAULT_MODEL
-    enable_fallback = st.toggle("Try fallback models on overload", value=True)
+    enable_fallback = st.toggle("Try fallback models on overload / model errors", value=True)
     enhanced_review = st.toggle(
         "Second opinion (slower)", value=False,
         help="Makes an extra API request. Leave off for the fastest workflow."
@@ -109,6 +110,67 @@ def get_api_key() -> str | None:
 def make_client():
     key = get_api_key()
     return genai.Client(api_key=key) if key else None
+
+def discover_image_models(client):
+    """List models enabled for this API key that support generateContent.
+    The public model metadata does not explicitly enumerate image MIME support,
+    so prefer Gemini-family generation models and exclude clearly non-vision tasks.
+    """
+    discovered = []
+    excluded = ("embedding", "imagen", "veo", "tts", "audio", "live", "aqa", "robotics")
+    for item in client.models.list():
+        name = (getattr(item, "name", "") or "").replace("models/", "")
+        supported = getattr(item, "supported_actions", None)
+        if supported is None:
+            supported = getattr(item, "supported_generation_methods", None)
+        if not name or "gemini" not in name.lower():
+            continue
+        if any(term in name.lower() for term in excluded):
+            continue
+        if supported and not any("generatecontent" in str(action).lower() for action in supported):
+            continue
+        discovered.append(name)
+    # Prefer current Flash aliases and stable-looking model IDs, while preserving
+    # the exact model names returned by the API.
+    def rank(name):
+        n = name.lower()
+        return (0 if "flash-latest" in n else
+                1 if "2.5-flash" in n else
+                2 if "flash" in n and "preview" not in n else
+                3 if "pro" in n else 4, n)
+    return sorted(set(discovered), key=rank)
+
+# Discover models only when requested, avoiding an extra API call on every rerun.
+if st.sidebar.button("↻ Discover available models", use_container_width=True):
+    client_for_models = make_client()
+    if client_for_models is None:
+        st.sidebar.error("Configure GEMINI_API_KEY before discovering models.")
+    else:
+        with st.sidebar:
+            with st.spinner("Checking models enabled for this API key…"):
+                try:
+                    st.session_state["available_models"] = discover_image_models(client_for_models)
+                    st.session_state["model_discovery_error"] = None
+                except Exception as exc:
+                    st.session_state["model_discovery_error"] = str(exc)[:300]
+                    st.session_state["available_models"] = []
+        st.rerun()
+
+available_models = st.session_state.get("available_models", [])
+if available_models:
+    preferred = model_name if model_name in available_models else available_models[0]
+    model_name = st.sidebar.selectbox(
+        "Available models",
+        options=available_models,
+        index=available_models.index(preferred),
+        help="These model IDs were returned by the Models API for your current API key."
+    )
+    st.sidebar.caption(f"{len(available_models)} compatible generation model(s) listed.")
+elif st.session_state.get("model_discovery_error"):
+    st.sidebar.warning("Could not list models. Check API key, project access, and network.")
+    st.sidebar.caption(st.session_state["model_discovery_error"])
+else:
+    st.sidebar.caption("Click Discover available models to verify which models your API key can access.")
 
 def normalize_image(img: Image.Image) -> Image.Image:
     img = ImageOps.exif_transpose(img).convert("RGB")
@@ -178,6 +240,10 @@ def is_rate_or_overload(exc: Exception) -> bool:
     msg = str(exc).lower()
     return any(term in msg for term in ("503", "unavailable", "high demand", "429", "resource_exhausted", "rate limit"))
 
+def is_model_unavailable(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(term in msg for term in ("404", "not found", "unknown model", "model is not found", "not supported for generatecontent"))
+
 def call_model_with_retry(client, model: str, prompt: str, img: Image.Image, attempts: int = MAX_RETRIES):
     """Retry transient service errors with exponential backoff and jitter."""
     last_exc = None
@@ -204,7 +270,8 @@ def call_model_with_retry(client, model: str, prompt: str, img: Image.Image, att
 def ask_with_fallback(client, selected_model: str, prompt: str, img: Image.Image, fallback_enabled: bool):
     models = [selected_model]
     if fallback_enabled:
-        for candidate in FALLBACK_MODELS:
+        candidates = st.session_state.get("available_models") or FALLBACK_MODELS
+        for candidate in candidates:
             if candidate not in models:
                 models.append(candidate)
     last_exc = None
@@ -214,10 +281,10 @@ def ask_with_fallback(client, selected_model: str, prompt: str, img: Image.Image
             return data, used_model
         except Exception as exc:
             last_exc = exc
-            if idx < len(models) - 1 and is_rate_or_overload(exc):
-                st.warning(f"{model} remains unavailable after retries. Trying fallback model {models[idx + 1]}…")
+            if idx < len(models) - 1 and (is_rate_or_overload(exc) or is_model_unavailable(exc)):
+                st.warning(f"{model} is unavailable for this request. Trying fallback model {models[idx + 1]}…")
                 continue
-            if idx < len(models) - 1 and not is_transient_error(exc):
+            if idx < len(models) - 1 and not is_transient_error(exc) and not is_model_unavailable(exc):
                 # Do not mask invalid-key / permission / malformed-request problems with fallback attempts.
                 raise
     raise last_exc
@@ -395,8 +462,8 @@ if analyze_clicked and image is not None:
                     st.caption("Automatic retries and fallback models were attempted where applicable.")
                 elif any(x in low for x in ("api key", "permission", "unauthorized", "403", "401")):
                     st.error("The API key may be invalid or lack permission for this model. Check GEMINI_API_KEY and the model access settings.")
-                elif "404" in low or "not found" in low:
-                    st.error("The selected model may not be available to your API project. Choose an enabled image-capable Gemini model in the sidebar.")
+                elif "404" in low or "not found" in low or "unknown model" in low:
+                    st.error("The selected model is not available to this API key. Click ‘Discover available models’ in the sidebar and select a listed model. If discovery returns no models, verify the API key and Google AI Studio project.")
                 else:
                     st.error(f"Inspection failed: {msg[:500]}")
 
