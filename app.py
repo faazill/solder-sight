@@ -303,11 +303,13 @@ if not st.session_state.calibrated:
         BOX_CANVAS_H,
     )
 
+    canvas_background = box_panel.convert("RGBA")
+
     canvas_result = st_canvas(
         fill_color="rgba(0, 180, 255, 0.15)",
         stroke_width=2,
         stroke_color="#00B4FF",
-        background_image=box_panel,
+        background_image=canvas_background,
         update_streamlit=True,
         height=BOX_CANVAS_H,
         width=BOX_CANVAS_W,
