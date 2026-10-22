@@ -15,7 +15,7 @@ from google.genai import types
 
 APP_NAME = "SolderSight"
 DEFAULT_MODEL = "gemini-3.8-flash"
-FALLBACK_MODEL = "gemini-3.5-flash"
+FALLBACK_MODEL = "gemini-2.5-flash-lite"
 MAX_IMAGE_MB = 12
 MAX_DIMENSION = 1800
 
