@@ -234,12 +234,15 @@ def ask_vision(client, model: str, prompt: str, img: Image.Image) -> dict[str, A
     )
 
 LOCATE_PROMPT = """
-Task: locate candidate solder joints on a PCB photograph for a human-selected inspection.
-Return JSON only:
-{"summary":"short summary","joints":[{"joint_id":1,"box_2d":[ymin,xmin,ymax,xmax],"description":"short region description","visibility":"clear|partly_obscured|active_soldering|unclear"}],"limitations":[]}
-Coordinates are normalized integers 0–1000 in [ymin,xmin,ymax,xmax] order relative to the full image.
-Include plausible solder joints/pads only. Exclude tools, fingers, wire spools, flux containers, and unrelated components.
-Be conservative: don't invent regions. Include up to 30 candidates. If there are no confidently identifiable solder joints, return an empty list.
+You are analyzing a PCB image to propose candidate solder-work locations for human review.
+Return valid JSON only, matching this schema:
+{"summary":"short overview","joints":[{"joint_id":1,"box_2d":[ymin,xmin,ymax,xmax],"point_2d":[y,x],"action":"SOLDER|DESOLDER|INSPECT","description":"short location description","reason":"visible evidence for the proposed action","confidence":"low|medium|high","visibility":"clear|partly_obscured|active_soldering|unclear"}],"limitations":[]}
+All coordinates are normalized integers from 0 to 1000 relative to the FULL image. box_2d order is [ymin,xmin,ymax,xmax]. point_2d order is [y,x] and should mark the exact recommended tool-contact target (center of the pad/joint), not the center of a broad component. Do not return coordinates in centimeters; the application calculates those from the user's entered physical board dimensions.
+Action rules:
+- SOLDER: a clearly visible pad/joint appears unpopulated or has visibly insufficient solder and likely needs solder added.
+- DESOLDER: visible evidence supports removing solder, such as a solder bridge, obvious excess solder, or a clearly defective joint that needs removal/rework. Do NOT choose DESOLDER merely because a joint already has solder.
+- INSPECT: evidence is ambiguous, the target is obscured, or the image cannot justify either action confidently.
+Give a short evidence-based reason and conservative confidence. Do not claim certainty from a single photograph. Include up to 30 useful candidates, ordered by priority. Exclude tools, fingers, labels, and unrelated components. If no candidates can be identified, return an empty joints list and explain why in limitations.
 """
 
 INSPECT_PROMPT = """
@@ -286,18 +289,31 @@ def box_pixels(box, w, h, padding=0.12):
     return max(0,int(x1-px)), max(0,int(y1-py)), min(w,int(x2+px)), min(h,int(y2+py))
 
 def draw_candidate_boxes(img, joints):
+    """Overlay candidate region boxes and their proposed action/contact point."""
     out = img.copy()
     draw = ImageDraw.Draw(out)
-    w,h = out.size
-    scale = max(2, w//700)
-    for j in joints:
+    w, h = out.size
+    scale = max(2, w // 700)
+    colors = {"SOLDER": (20, 155, 85), "DESOLDER": (220, 70, 55), "INSPECT": (230, 155, 25)}
+    for idx, j in enumerate(joints, start=1):
         try:
-            x1,y1,x2,y2 = box_pixels(j["box_2d"],w,h,0)
-            draw.rectangle((x1,y1,x2,y2), outline=(0,190,210), width=scale)
-            label = f"Joint {j.get('joint_id','?')}"
-            top = max(0,y1-24)
-            draw.rectangle((x1,top,min(w,x1+120),y1), fill=(13,49,67))
-            draw.text((x1+4,top+4),label,fill=(255,255,255))
+            x1, y1, x2, y2 = box_pixels(j["box_2d"], w, h, 0)
+            action = str(j.get("action", "INSPECT")).upper()
+            color = colors.get(action, colors["INSPECT"])
+            draw.rectangle((x1, y1, x2, y2), outline=color, width=scale)
+            point = j.get("point_2d")
+            if isinstance(point, list) and len(point) == 2:
+                py, px = float(point[0]), float(point[1])
+                cx, cy = int(px * w / 1000), int(py * h / 1000)
+            else:
+                cx, cy = (x1+x2)//2, (y1+y2)//2
+            r = max(5, scale * 3)
+            draw.ellipse((cx-r, cy-r, cx+r, cy+r), fill=color, outline=(255,255,255), width=max(1, scale//2))
+            label = f"{j.get('joint_id', idx)} {action}"
+            top = max(0, y1-24)
+            label_right = min(w, x1 + max(100, len(label)*8))
+            draw.rectangle((x1, top, label_right, y1), fill=color)
+            draw.text((x1+4, top+4), label, fill=(255,255,255))
         except Exception:
             continue
     return out
@@ -346,7 +362,7 @@ def crop_from_box(image, box):
 # Header summary
 st.markdown("### Start an inspection")
 st.markdown(
-    '<div class="section-help">Upload a clear PCB image, draw a rectangle around the work area, preview the crop, and inspect it.</div>',
+    '<div class="section-help">Upload a clear PCB image, draw a work-area crop, enter the measured board dimensions, and ask Gemini to suggest solder-work targets with X/Y coordinates.</div>',
     unsafe_allow_html=True,
 )
 
@@ -395,15 +411,15 @@ if uploaded:
     dim_col1, dim_col2 = st.columns(2)
     with dim_col1:
         board_width_cm = st.number_input(
-            "Full PCB width (cm, optional)", min_value=0.0, value=0.0, step=0.5,
+            "Reference PCB width (cm)", min_value=0.0, value=0.0, step=0.5,
             key="crop_board_width_cm",
-            help="Enter the real width of the full PCB image area to estimate crop width in cm. Leave 0 if unknown."
+            help="Measured physical width represented by the full image, used to convert AI target X positions into centimetres."
         )
     with dim_col2:
         board_height_cm = st.number_input(
-            "Full PCB height (cm, optional)", min_value=0.0, value=0.0, step=0.5,
+            "Reference PCB height (cm)", min_value=0.0, value=0.0, step=0.5,
             key="crop_board_height_cm",
-            help="Enter the real height of the full PCB image area to estimate crop height in cm. Leave 0 if unknown."
+            help="Measured physical height represented by the full image, used to convert AI target Y positions into centimetres."
         )
 
     try:
@@ -526,37 +542,45 @@ if uploaded:
         st.image(image, use_container_width=True)
     with col_actions:
         st.markdown('<div class="section-title">Inspection workflow</div>', unsafe_allow_html=True)
-        st.markdown("**01 · Locate joints**")
-        st.caption("Find likely solder regions. You will choose which one to inspect.")
+        st.markdown("**Find solder-work candidates**")
+        st.caption("Gemini proposes a tool-contact point and classifies it as SOLDER, DESOLDER, or INSPECT. Coordinates are estimated from your reference board dimensions above.")
         locate = st.button("Find candidate joints", type="primary", use_container_width=True)
         if locate:
-            with st.spinner("Reviewing the image for candidate solder joints…"):
+            with st.spinner("Gemini is locating candidate solder-work points…"):
                 try:
                     det = ask_vision(client, model_name, LOCATE_PROMPT, image)
                     joints = det.get("joints", [])
-                    # Normalize/validate IDs and coordinates.
                     valid = []
-                    for idx,j in enumerate(joints[:30], start=1):
+                    for idx, j in enumerate(joints[:30], start=1):
                         b = j.get("box_2d")
-                        if isinstance(b,list) and len(b)==4:
-                            try:
-                                b = [max(0,min(1000,int(float(v)))) for v in b]
-                                if b[2] > b[0] and b[3] > b[1]:
-                                    j["box_2d"] = b
-                                    j["joint_id"] = j.get("joint_id",idx)
-                                    valid.append(j)
-                            except (ValueError,TypeError):
-                                pass
+                        try:
+                            if not isinstance(b, list) or len(b) != 4:
+                                continue
+                            b = [max(0, min(1000, int(float(v)))) for v in b]
+                            if b[2] <= b[0] or b[3] <= b[1]:
+                                continue
+                            point = j.get("point_2d")
+                            if not isinstance(point, list) or len(point) != 2:
+                                point = [(b[0] + b[2]) // 2, (b[1] + b[3]) // 2]
+                            point = [max(0, min(1000, int(float(v)))) for v in point]
+                            j["box_2d"] = b
+                            j["point_2d"] = point
+                            j["joint_id"] = idx
+                            action = str(j.get("action", "INSPECT")).upper()
+                            j["action"] = action if action in {"SOLDER", "DESOLDER", "INSPECT"} else "INSPECT"
+                            conf = str(j.get("confidence", "low")).lower()
+                            j["confidence"] = conf if conf in {"low", "medium", "high"} else "low"
+                            valid.append(j)
+                        except (ValueError, TypeError, OverflowError):
+                            continue
                     det["joints"] = valid
                     st.session_state["detection"] = det
-                    st.session_state.pop("inspection",None)
-                    st.session_state.pop("verifier",None)
+                    st.session_state.pop("inspection", None)
+                    st.session_state.pop("verifier", None)
                 except Exception as exc:
                     st.error(f"Could not locate joints: {str(exc)[:500]}")
-        st.markdown("**02 · Select a joint**")
-        st.caption("Candidate boxes are suggestions. Confirm the box covers the actual solder.")
-        st.markdown("**03 · Inspect and review**")
-        st.caption("The selected close-up is checked for visible quality issues and a recommended next step.")
+        st.markdown("**Review candidates**")
+        st.caption("Check each point against the image before using it. AI detections are suggestions, not machine commands.")
 
     detection = st.session_state.get("detection")
     if detection:
@@ -564,11 +588,44 @@ if uploaded:
         st.markdown("---")
         st.markdown('<div class="section-title">Candidate regions</div>', unsafe_allow_html=True)
         if joints:
-            st.image(draw_candidate_boxes(image,joints), use_container_width=True)
-            st.caption(detection.get("summary","Review the boxes before choosing a joint."))
+            st.image(draw_candidate_boxes(image, joints), use_container_width=True)
+            st.caption(detection.get("summary", "Review the boxes and action labels before choosing a candidate."))
+            if detection.get("limitations"):
+                for limitation in detection["limitations"]:
+                    st.caption(f"Limitation: {limitation}")
+            table_rows = []
+            for j in joints:
+                py_norm, px_norm = j["point_2d"]
+                row = {
+                    "Point": j["joint_id"],
+                    "Action": j.get("action", "INSPECT"),
+                    "Pixel X": round(px_norm * image.width / 1000),
+                    "Pixel Y": round(py_norm * image.height / 1000),
+                    "Confidence": j.get("confidence", "low"),
+                    "Reason": j.get("reason", j.get("description", "")),
+                }
+                if board_width_cm > 0:
+                    row["X (cm from top-left)"] = round(px_norm * board_width_cm / 1000, 3)
+                else:
+                    row["X (cm from top-left)"] = "Enter reference width"
+                if board_height_cm > 0:
+                    row["Y (cm from top-left)"] = round(py_norm * board_height_cm / 1000, 3)
+                else:
+                    row["Y (cm from top-left)"] = "Enter reference height"
+                table_rows.append(row)
+            st.markdown("#### Candidate coordinates and recommended action")
+            st.caption("Origin is the top-left corner of the full uploaded image; X increases to the right and Y increases downward. Enter the measured width and height of the image/board above for centimetre coordinates.")
+            st.dataframe(table_rows, use_container_width=True, hide_index=True)
+            import csv
+            csv_buffer = io.StringIO()
+            csv_writer = csv.DictWriter(csv_buffer, fieldnames=list(table_rows[0].keys()))
+            csv_writer.writeheader()
+            csv_writer.writerows(table_rows)
+            st.download_button("Download candidate coordinates (CSV)", data=csv_buffer.getvalue(), file_name="soldersight_candidate_coordinates.csv", mime="text/csv")
+            st.warning("Human verification required: a photo may not reveal pad connectivity, hidden defects, or whether removal is safe. These are proposed locations only; no hardware commands are sent.")
             option_map = {}
             for idx,j in enumerate(joints):
-                label = f"Joint {j['joint_id']} · {j.get('description','Candidate region')[:90]}"
+                label = f"#{j['joint_id']} · {j.get('action', 'INSPECT')} · {j.get('description','Candidate region')[:75]}"
                 option_map[label] = j
             selected_label = st.selectbox("Which box contains the solder you want to inspect?", list(option_map.keys()))
             selected_joint = option_map[selected_label]
@@ -582,7 +639,17 @@ if uploaded:
             with details_col:
                 st.markdown('<div class="section-title">Region details</div>', unsafe_allow_html=True)
                 st.write(f"**Joint:** {selected_joint['joint_id']}")
-                st.write(f"**Visibility estimate:** {selected_joint.get('visibility','not specified').replace('_',' ').title()}")
+                st.write(f"**Proposed action:** {selected_joint.get('action', 'INSPECT')}")
+                py_norm, px_norm = selected_joint["point_2d"]
+                pixel_x = round(px_norm * image.width / 1000)
+                pixel_y = round(py_norm * image.height / 1000)
+                st.write(f"**Tool target (pixels):** X={pixel_x}, Y={pixel_y}")
+                if board_width_cm > 0 and board_height_cm > 0:
+                    st.write(f"**Tool target (cm from top-left):** X={px_norm*board_width_cm/1000:.3f} cm, Y={py_norm*board_height_cm/1000:.3f} cm")
+                else:
+                    st.warning("Enter both reference PCB dimensions above to calculate X/Y in centimetres.")
+                st.write(f"**Reason:** {selected_joint.get('reason', 'No specific visual reason returned.')}")
+                st.write(f"**Confidence:** {selected_joint.get('confidence', 'low').title()} · **Visibility:** {selected_joint.get('visibility','not specified').replace('_',' ').title()}")
                 st.write(f"**Region:** {selected_joint.get('description','Candidate solder region')}")
                 inspect_btn = st.button("Inspect this joint", type="primary", use_container_width=True)
                 if inspect_btn:
