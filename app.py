@@ -2,6 +2,9 @@ import io
 import json
 import os
 import re
+import time
+import math
+import random
 from datetime import datetime, timezone
 from typing import Any
 
@@ -12,6 +15,7 @@ from google.genai import types
 
 APP_NAME = "SolderSight"
 DEFAULT_MODEL = "gemini-3.8-flash"
+FALLBACK_MODEL = "gemini-3.5-flash"
 MAX_IMAGE_MB = 12
 MAX_DIMENSION = 1800
 
@@ -57,10 +61,11 @@ footer {visibility:hidden;}
 with st.sidebar:
     st.markdown("### Inspection setup")
     model_name = st.text_input(
-        "Analysis model",
-        value=DEFAULT_MODEL,
-        help="Uses a vision-capable model available to your API project."
+        "Primary analysis model",
+        value=os.environ.get("SOLDERSIGHT_MODEL", DEFAULT_MODEL),
+        help=f"Primary model. If it errors, SolderSight tries {FALLBACK_MODEL}. These IDs must be enabled for your API key."
     ).strip() or DEFAULT_MODEL
+    st.caption(f"Automatic fallback: `{FALLBACK_MODEL}`")
     enhanced_review = st.toggle(
         "Enhanced review",
         value=True,
@@ -121,16 +126,80 @@ def parse_json_response(text: str) -> dict[str, Any]:
         raise ValueError("Unexpected response format. Please retry.")
     return parsed
 
-def ask_vision(client, model: str, prompt: str, img: Image.Image) -> dict[str, Any]:
+def ask_vision_once(client, model: str, prompt: str, img: Image.Image) -> dict[str, Any]:
     response = client.models.generate_content(
         model=model,
         contents=[prompt, as_part(img)],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            temperature=0.1,
         ),
     )
     return parse_json_response(response.text)
+
+
+def is_transient_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(term in message for term in (
+        "503", "unavailable", "high demand", "429", "resource_exhausted",
+        "rate limit", "500", "502", "504", "deadline", "temporarily",
+        "internal error", "overloaded", "try again"
+    ))
+
+
+def is_auth_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(term in message for term in (
+        "api key not valid", "invalid api key", "unauthenticated", "401"
+    ))
+
+
+def ask_vision(client, model: str, prompt: str, img: Image.Image) -> dict[str, Any]:
+    """Try the selected model first, then the configured fallback.
+
+    Retry transient service errors with backoff. Model-not-found/unsupported errors
+    move directly to the fallback instead of wasting retries. The same helper is
+    used for locate, inspect, and second-review calls.
+    """
+    models = []
+    for candidate in (model, FALLBACK_MODEL):
+        candidate = (candidate or "").strip()
+        if candidate and candidate not in models:
+            models.append(candidate)
+    failures = []
+    for candidate in models:
+        attempts = 3 if candidate == models[0] else 2
+        for attempt in range(attempts):
+            try:
+                result = ask_vision_once(client, candidate, prompt, img)
+                if candidate != models[0]:
+                    st.info(f"Analysis succeeded using fallback model `{candidate}`.")
+                return result
+            except Exception as exc:
+                failures.append(f"{candidate}: {str(exc)[:240]}")
+                message = str(exc).lower()
+                model_unavailable = any(term in message for term in (
+                    "404", "not found", "unknown model", "model is not found",
+                    "not supported for generatecontent", "unsupported model"
+                ))
+                if is_auth_error(exc):
+                    # A second model will not fix a bad key or project permission.
+                    raise RuntimeError(
+                        "Gemini authentication/permission failed. Check GEMINI_API_KEY and API access. "
+                        + str(exc)[:300]
+                    ) from exc
+                if is_transient_error(exc) and attempt < attempts - 1:
+                    wait = min(6.0, 1.0 * (2 ** attempt)) + random.uniform(0, 0.4)
+                    time.sleep(wait)
+                    continue
+                if candidate != models[-1]:
+                    reason = "model unavailable" if model_unavailable else "request failed"
+                    st.warning(f"`{candidate}` {reason}; trying fallback `{models[models.index(candidate)+1]}`.")
+                break
+    raise RuntimeError(
+        "Both the primary and fallback Gemini model failed. Verify that `gemini-3.8-flash` "
+        "and `gemini-3.5-flash` are real, image-capable model IDs enabled for your API project. "
+        "Details: " + " | ".join(failures)
+    )
 
 LOCATE_PROMPT = """
 Task: locate candidate solder joints on a PCB photograph for a human-selected inspection.
@@ -270,7 +339,8 @@ if uploaded:
     # Clear stale session state when a different file is uploaded.
     image_key = f"{uploaded.name}:{uploaded.size}:{hash(uploaded.getvalue())}"
     if st.session_state.get("image_key") != image_key:
-        for key in ["detection","inspection","verifier","crop","selected_label","report"]:
+        for key in ["detection","inspection","verifier","crop","selected_label","report",
+                    "cal_ref_a","cal_ref_b","cal_targets","cal_clicked"]:
             st.session_state.pop(key, None)
         st.session_state["image_key"] = image_key
         st.session_state["source_filename"] = uploaded.name
@@ -279,6 +349,120 @@ if uploaded:
     info1.metric("Image", uploaded.name[:26] + ("…" if len(uploaded.name)>26 else ""))
     info2.metric("Working resolution", f"{image.width} × {image.height}")
     info3.metric("File size", f"{uploaded.size/1024:.0f} KB")
+
+    # ---------------- XY coordinate calibration / target planning ----------------
+    st.markdown("---")
+    st.markdown('<div class="section-title">PCB XY coordinate planner</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-help">Mark two reference points with a known real-world distance, then mark target solder locations. Coordinates are calculated in centimetres relative to reference A.</div>',
+        unsafe_allow_html=True,
+    )
+    st.info(
+        "Calibration assumption: the PCB is approximately planar and the photo has little perspective distortion. "
+        "This converts image positions to board-relative coordinates; it does not control a soldering robot."
+    )
+
+    st.session_state.setdefault("cal_ref_a", None)
+    st.session_state.setdefault("cal_ref_b", None)
+    st.session_state.setdefault("cal_targets", [])
+    st.session_state.setdefault("cal_clicked", None)
+
+    try:
+        from streamlit_image_coordinates import streamlit_image_coordinates
+        click_picker_available = True
+    except Exception:
+        click_picker_available = False
+
+    st.markdown("**Step 1 · Mark the reference points**")
+    if click_picker_available:
+        st.caption("Click the PCB image to capture a point, then use the buttons below to save that click as Reference A, Reference B, or a solder target.")
+        click_value = streamlit_image_coordinates(image, key=f"xy_picker_{image_key}")
+        if click_value and "x" in click_value and "y" in click_value:
+            st.session_state["cal_clicked"] = (int(click_value["x"]), int(click_value["y"]))
+        if st.session_state.get("cal_clicked"):
+            cx, cy = st.session_state["cal_clicked"]
+            st.caption(f"Last clicked pixel: x = {cx}, y = {cy}")
+    else:
+        st.warning("Image-click support is unavailable. Enter pixel coordinates manually below; the coordinate calculations are the same.")
+        p1, p2 = st.columns(2)
+        with p1:
+            fallback_x = st.number_input("Clicked X pixel", min_value=0, max_value=image.width-1, value=0, key="fallback_click_x")
+        with p2:
+            fallback_y = st.number_input("Clicked Y pixel", min_value=0, max_value=image.height-1, value=0, key="fallback_click_y")
+        st.session_state["cal_clicked"] = (int(fallback_x), int(fallback_y))
+        cx, cy = st.session_state["cal_clicked"]
+
+    ref_cols = st.columns(3)
+    if ref_cols[0].button("Save as Reference A", use_container_width=True):
+        st.session_state["cal_ref_a"] = st.session_state.get("cal_clicked")
+    if ref_cols[1].button("Save as Reference B", use_container_width=True):
+        st.session_state["cal_ref_b"] = st.session_state.get("cal_clicked")
+    target_label = ref_cols[2].text_input("Target label", value=f"Target {len(st.session_state['cal_targets'])+1}", key="target_label_input")
+    if ref_cols[2].button("Add clicked target", use_container_width=True):
+        point = st.session_state.get("cal_clicked")
+        if point:
+            st.session_state["cal_targets"].append({"label": target_label.strip() or f"Target {len(st.session_state['cal_targets'])+1}", "px_x": int(point[0]), "px_y": int(point[1])})
+
+    known_distance = st.number_input(
+        "Known distance from Reference A to Reference B (cm)", min_value=0.001, value=2.5, step=0.5, format="%.3f",
+        help="Measure between the exact physical points you mark in the image. This distance defines the positive X direction from A to B."
+    )
+    invert_y = st.checkbox("Invert Y axis", value=False, help="By default, positive Y is perpendicular to A→B in the image-down direction for a horizontal reference line.")
+    ra, rb = st.session_state.get("cal_ref_a"), st.session_state.get("cal_ref_b")
+    status_cols = st.columns(2)
+    status_cols[0].metric("Reference A", f"{ra[0]}, {ra[1]} px" if ra else "Not marked")
+    status_cols[1].metric("Reference B", f"{rb[0]}, {rb[1]} px" if rb else "Not marked")
+
+    if ra and rb:
+        dx_ref, dy_ref = rb[0]-ra[0], rb[1]-ra[1]
+        pixel_distance = math.hypot(dx_ref, dy_ref)
+        if pixel_distance < 1:
+            st.error("Reference A and B must be different points. Mark them again.")
+        else:
+            scale_cm_per_px = float(known_distance) / pixel_distance
+            ux, uy = dx_ref/pixel_distance, dy_ref/pixel_distance
+            # Positive local Y is perpendicular clockwise in image coordinates.
+            vx, vy = -uy, ux
+            if invert_y:
+                vx, vy = -vx, -vy
+            st.success(f"Calibration ready · {scale_cm_per_px:.6f} cm/pixel · reference span {pixel_distance:.1f} px")
+            rows = []
+            for i, point in enumerate(st.session_state["cal_targets"], start=1):
+                px_dx, px_dy = point["px_x"]-ra[0], point["px_y"]-ra[1]
+                x_cm = (px_dx*ux + px_dy*uy) * scale_cm_per_px
+                y_cm = (px_dx*vx + px_dy*vy) * scale_cm_per_px
+                rows.append({"Target": point["label"], "Pixel X": point["px_x"], "Pixel Y": point["px_y"], "X (cm)": round(x_cm, 4), "Y (cm)": round(y_cm, 4)})
+            if rows:
+                st.markdown("**Calibrated target coordinates**")
+                st.dataframe(rows, use_container_width=True, hide_index=True)
+                import csv
+                csv_buffer = io.StringIO()
+                writer = csv.DictWriter(csv_buffer, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(rows)
+                st.download_button("Download XY targets (CSV)", data=csv_buffer.getvalue(), file_name="soldersight_xy_targets.csv", mime="text/csv")
+                if st.button("Clear target points", key="clear_xy_targets"):
+                    st.session_state["cal_targets"] = []
+                    st.rerun()
+            else:
+                st.caption("No targets added yet. Click a target location and choose Add clicked target.")
+
+    # Draw reference/target markers over the image for a quick visual check.
+    overlay = image.copy()
+    draw = ImageDraw.Draw(overlay)
+    marker_radius = max(5, min(image.width, image.height)//100)
+    for point, color, label in [(ra, (0, 120, 255), "A"), (rb, (255, 110, 0), "B")]:
+        if point:
+            x0, y0 = point
+            draw.ellipse((x0-marker_radius, y0-marker_radius, x0+marker_radius, y0+marker_radius), outline=color, width=max(2, marker_radius//2))
+            draw.text((x0+marker_radius+2, max(0,y0-marker_radius-12)), label, fill=color)
+    for idx, point in enumerate(st.session_state["cal_targets"], start=1):
+        x0, y0 = point["px_x"], point["px_y"]
+        draw.ellipse((x0-marker_radius, y0-marker_radius, x0+marker_radius, y0+marker_radius), fill=(0, 160, 100), outline=(255,255,255), width=2)
+        draw.text((x0+marker_radius+2, max(0,y0-marker_radius-12)), str(idx), fill=(0, 120, 75))
+    st.image(overlay, caption="Coordinate marker preview · blue = A, orange = B, green = target", use_container_width=True)
+    st.caption("For robot use, you still need camera-to-robot calibration, machine homing, tool-tip offsets, axis/sign validation, and physical safety interlocks. Do not send these coordinates to hardware without validating the complete transform.")
+    # -----------------------------------------------------------------------------
 
     with st.expander("Image quality checklist", expanded=False):
         st.write("Before analysis, check that:")
