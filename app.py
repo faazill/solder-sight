@@ -346,7 +346,7 @@ def crop_from_box(image, box):
 # Header summary
 st.markdown("### Start an inspection")
 st.markdown(
-    '<div class="section-help">Upload a clear image, calibrate the board, draw the work-area crop, add solder targets, and review the ordered X/Y coordinates before inspecting each target.</div>',
+    '<div class="section-help">Upload a clear PCB image, draw a rectangle around the work area, preview the crop, and inspect it.</div>',
     unsafe_allow_html=True,
 )
 
@@ -382,148 +382,30 @@ if uploaded:
     info2.metric("Working resolution", f"{image.width} × {image.height}")
     info3.metric("File size", f"{uploaded.size/1024:.0f} KB")
 
-    # ---------------- XY coordinate calibration / target planning ----------------
+    # ---------------- Interactive work-area crop ----------------
     st.markdown("---")
-    st.markdown('<div class="section-title">Step 1 of 3 · Calibrate and mark solder targets</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Draw the work-area / crop box</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="section-help">Click two measured reference points on the photo, enter their real distance, then click the solder locations you want to inspect.</div>',
+        '<div class="section-help">Drag a rectangle from one corner to the opposite corner around the PCB area you want to work on. No reference-point step is required. This is only an image selection; it does not move hardware.</div>',
         unsafe_allow_html=True,
     )
-    st.info(
-        "Choose Reference A as your board origin (X=0, Y=0). Reference B sets the positive X direction and scale. "
-        "Targets show X/Y in cm from A, plus traversal order. This assumes a flat board and minimal perspective distortion; it does not control a robot."
-    )
 
-    st.session_state.setdefault("cal_ref_a", None)
-    st.session_state.setdefault("cal_ref_b", None)
-    st.session_state.setdefault("cal_targets", [])
-    st.session_state.setdefault("cal_clicked", None)
+    # Optional physical board dimensions let us estimate the drawn box size in cm
+    # without requiring the separate reference-point workflow.
+    dim_col1, dim_col2 = st.columns(2)
+    with dim_col1:
+        board_width_cm = st.number_input(
+            "Full PCB width (cm, optional)", min_value=0.0, value=0.0, step=0.5,
+            key="crop_board_width_cm",
+            help="Enter the real width of the full PCB image area to estimate crop width in cm. Leave 0 if unknown."
+        )
+    with dim_col2:
+        board_height_cm = st.number_input(
+            "Full PCB height (cm, optional)", min_value=0.0, value=0.0, step=0.5,
+            key="crop_board_height_cm",
+            help="Enter the real height of the full PCB image area to estimate crop height in cm. Leave 0 if unknown."
+        )
 
-    try:
-        from streamlit_image_coordinates import streamlit_image_coordinates
-        click_picker_available = True
-    except Exception:
-        click_picker_available = False
-
-    st.markdown("**Step 1 · Mark the reference points**")
-    if click_picker_available:
-        st.caption("Click the image to select a point. Then save it as Reference A, Reference B, or a target. Click positions are scaled back to the source-image pixels.")
-        click_value = streamlit_image_coordinates(image, key=f"xy_picker_{image_key}")
-        if click_value and "x" in click_value and "y" in click_value:
-            mapped_point = click_to_image_pixel(click_value, image)
-            if mapped_point:
-                st.session_state["cal_clicked"] = mapped_point
-        if st.session_state.get("cal_clicked"):
-            cx, cy = st.session_state["cal_clicked"]
-            st.info(f"Selected image point: **({cx}, {cy}) px**. Save it as Reference A, Reference B, or a target below.")
-    else:
-        st.error("Image-click support is unavailable. Install dependencies with `pip install -r requirements.txt` and restart Streamlit. A manual pixel-entry fallback is shown below.")
-        p1, p2 = st.columns(2)
-        with p1:
-            fallback_x = st.number_input("Clicked X pixel", min_value=0, max_value=image.width-1, value=0, key="fallback_click_x")
-        with p2:
-            fallback_y = st.number_input("Clicked Y pixel", min_value=0, max_value=image.height-1, value=0, key="fallback_click_y")
-        st.session_state["cal_clicked"] = (int(fallback_x), int(fallback_y))
-        cx, cy = st.session_state["cal_clicked"]
-
-    ref_cols = st.columns(3)
-    if ref_cols[0].button("Save as Reference A", use_container_width=True):
-        st.session_state["cal_ref_a"] = st.session_state.get("cal_clicked")
-    if ref_cols[1].button("Save as Reference B", use_container_width=True):
-        st.session_state["cal_ref_b"] = st.session_state.get("cal_clicked")
-    target_label = ref_cols[2].text_input("Target label", value=f"Target {len(st.session_state['cal_targets'])+1}", key="target_label_input")
-    if ref_cols[2].button("Add clicked target", use_container_width=True):
-        point = st.session_state.get("cal_clicked")
-        if point:
-            st.session_state["cal_targets"].append({"label": target_label.strip() or f"Target {len(st.session_state['cal_targets'])+1}", "px_x": int(point[0]), "px_y": int(point[1])})
-
-    known_distance = st.number_input(
-        "Real distance from Reference A to B (cm)", min_value=0.001, value=25.0, step=0.5, format="%.3f",
-        help="Example: enter 25 if the two exact points you clicked are 25 cm apart in real life. Positive X follows A to B."
-    )
-    invert_y = st.checkbox("Invert Y direction (positive Y points up on the image)", value=False, help="Unchecked means positive Y is perpendicular to A→B in the image-down direction.")
-    ra, rb = st.session_state.get("cal_ref_a"), st.session_state.get("cal_ref_b")
-    status_cols = st.columns(2)
-    status_cols[0].metric("Reference A", f"{ra[0]}, {ra[1]} px" if ra else "Not marked")
-    status_cols[1].metric("Reference B", f"{rb[0]}, {rb[1]} px" if rb else "Not marked")
-
-    if ra and rb:
-        dx_ref, dy_ref = rb[0]-ra[0], rb[1]-ra[1]
-        pixel_distance = math.hypot(dx_ref, dy_ref)
-        if pixel_distance < 1:
-            st.error("Reference A and B must be different points. Mark them again.")
-        else:
-            scale_cm_per_px = float(known_distance) / pixel_distance
-            ux, uy = dx_ref/pixel_distance, dy_ref/pixel_distance
-            # Positive local Y is perpendicular clockwise in image coordinates.
-            vx, vy = -uy, ux
-            if invert_y:
-                vx, vy = -vx, -vy
-            st.success(f"Calibration ready · {scale_cm_per_px:.6f} cm/pixel · reference span {pixel_distance:.1f} px")
-            rows = []
-            for i, point in enumerate(st.session_state["cal_targets"], start=1):
-                px_dx, px_dy = point["px_x"]-ra[0], point["px_y"]-ra[1]
-                x_cm = (px_dx*ux + px_dy*uy) * scale_cm_per_px
-                y_cm = (px_dx*vx + px_dy*vy) * scale_cm_per_px
-                rows.append({"Traversal order": i, "Target": point["label"], "Pixel X": point["px_x"], "Pixel Y": point["px_y"], "X (cm)": round(x_cm, 4), "Y (cm)": round(y_cm, 4)})
-            if rows:
-                st.markdown("**Calibrated target coordinates**")
-                st.dataframe(rows, use_container_width=True, hide_index=True)
-                import csv
-                csv_buffer = io.StringIO()
-                writer = csv.DictWriter(csv_buffer, fieldnames=list(rows[0].keys()))
-                writer.writeheader()
-                writer.writerows(rows)
-                st.download_button("Download XY targets (CSV)", data=csv_buffer.getvalue(), file_name="soldersight_xy_targets.csv", mime="text/csv")
-                clear_col, undo_col, up_col, down_col = st.columns(4)
-                with clear_col:
-                    if st.button("Clear all", key="clear_xy_targets", use_container_width=True):
-                        st.session_state["cal_targets"] = []
-                        st.rerun()
-                with undo_col:
-                    if st.button("Undo last", key="undo_xy_target", use_container_width=True,
-                                 disabled=not bool(st.session_state["cal_targets"])):
-                        st.session_state["cal_targets"].pop()
-                        st.rerun()
-                with up_col:
-                    move_idx = st.selectbox("Reorder point", options=list(range(len(st.session_state["cal_targets"]))),
-                                            format_func=lambda n: f"{n+1}. {st.session_state['cal_targets'][n]['label']}",
-                                            key="target_reorder_index") if st.session_state["cal_targets"] else None
-                    if st.button("Move earlier ↑", key="move_target_up", use_container_width=True,
-                                 disabled=move_idx is None or move_idx <= 0):
-                        points = st.session_state["cal_targets"]
-                        points[move_idx-1], points[move_idx] = points[move_idx], points[move_idx-1]
-                        st.session_state["cal_targets"] = points
-                        st.rerun()
-                with down_col:
-                    if st.button("Move later ↓", key="move_target_down", use_container_width=True,
-                                 disabled=move_idx is None or move_idx >= len(st.session_state["cal_targets"])-1):
-                        points = st.session_state["cal_targets"]
-                        points[move_idx+1], points[move_idx] = points[move_idx], points[move_idx+1]
-                        st.session_state["cal_targets"] = points
-                        st.rerun()
-            else:
-                st.caption("No targets added yet. Click a target location and choose Add clicked target.")
-
-    # Draw reference/target markers over the image for a quick visual check.
-    overlay = image.copy()
-    draw = ImageDraw.Draw(overlay)
-    marker_radius = max(5, min(image.width, image.height)//100)
-    for point, color, label in [(ra, (0, 120, 255), "A"), (rb, (255, 110, 0), "B")]:
-        if point:
-            x0, y0 = point
-            draw.ellipse((x0-marker_radius, y0-marker_radius, x0+marker_radius, y0+marker_radius), outline=color, width=max(2, marker_radius//2))
-            draw.text((x0+marker_radius+2, max(0,y0-marker_radius-12)), label, fill=color)
-    for idx, point in enumerate(st.session_state["cal_targets"], start=1):
-        x0, y0 = point["px_x"], point["px_y"]
-        draw.ellipse((x0-marker_radius, y0-marker_radius, x0+marker_radius, y0+marker_radius), fill=(0, 160, 100), outline=(255,255,255), width=2)
-        draw.text((x0+marker_radius+2, max(0,y0-marker_radius-12)), str(idx), fill=(0, 120, 75))
-    st.image(overlay, caption="Marked image · blue = Reference A, orange = Reference B, numbered green = solder targets in traversal order", use_container_width=True)
-
-    # Interactive crop / work-area rectangle. The canvas uses a scaled copy of the same image,
-    # then converts the rectangle back into normalized source-image pixel coordinates.
-    st.markdown("**Step 2 · Draw the work-area / crop box**")
-    st.caption("Drag from one corner to the opposite corner to draw a rectangle around the PCB area you want to work on. The box is only a visual plan; it does not move hardware.")
     try:
         from streamlit_drawable_canvas import st_canvas
         canvas_available = True
@@ -531,113 +413,98 @@ if uploaded:
         canvas_available = False
 
     if canvas_available:
-        canvas_w = min(1000, image.width)
-        canvas_h = max(1, round(image.height * canvas_w / image.width))
+        # Keep a manageable display size while preserving the source-image aspect ratio.
+        canvas_w = int(min(1000, image.width))
+        canvas_h = int(max(1, round(image.height * canvas_w / image.width)))
         if canvas_h > 680:
             canvas_h = 680
-            canvas_w = max(1, round(image.width * canvas_h / image.height))
-        canvas_bg = image.resize((canvas_w, canvas_h), Image.Resampling.LANCZOS)
-        crop_canvas = st_canvas(
-            fill_color="rgba(30, 144, 255, 0.16)", stroke_width=3, stroke_color="#1685ff",
-            background_image=canvas_bg, update_streamlit=True, height=canvas_h, width=canvas_w,
-            drawing_mode="rect", key=f"crop_canvas_{image_key}", display_toolbar=True,
-        )
-        crop_box = None
-        objects = (crop_canvas.json_data or {}).get("objects", []) if crop_canvas else []
-        rects = [obj for obj in objects if obj.get("type") == "rect" and float(obj.get("width", 0)) > 1 and float(obj.get("height", 0)) > 1]
-        if rects:
-            obj = rects[-1]
-            # Fabric.js may include scaleX/scaleY; account for them when mapping back.
-            left = float(obj.get("left", 0))
-            top = float(obj.get("top", 0))
-            rw = float(obj.get("width", 0)) * float(obj.get("scaleX", 1))
-            rh = float(obj.get("height", 0)) * float(obj.get("scaleY", 1))
-            x1 = max(0, min(image.width, round(left * image.width / canvas_w)))
-            y1 = max(0, min(image.height, round(top * image.height / canvas_h)))
-            x2 = max(0, min(image.width, round((left + rw) * image.width / canvas_w)))
-            y2 = max(0, min(image.height, round((top + rh) * image.height / canvas_h)))
-            if x2 > x1 and y2 > y1:
-                crop_box = (x1, y1, x2, y2)
-                st.session_state["crop_box_px"] = crop_box
-        else:
-            crop_box = st.session_state.get("crop_box_px")
+            canvas_w = int(max(1, round(image.width * canvas_h / image.height)))
+        canvas_bg = image.resize((canvas_w, canvas_h), Image.Resampling.LANCZOS).convert("RGB")
+        try:
+            crop_canvas = st_canvas(
+                fill_color="rgba(30, 144, 255, 0.16)",
+                stroke_width=3,
+                stroke_color="#1685ff",
+                background_image=canvas_bg,
+                update_streamlit=True,
+                height=int(canvas_h),
+                width=int(canvas_w),
+                drawing_mode="rect",
+                key=f"crop_canvas_{image_key}",
+            )
+            crop_box = None
+            objects = (crop_canvas.json_data or {}).get("objects", []) if crop_canvas else []
+            rects = [obj for obj in objects if obj.get("type") == "rect"
+                     and float(obj.get("width", 0)) > 1 and float(obj.get("height", 0)) > 1]
+            if rects:
+                obj = rects[-1]
+                left = float(obj.get("left", 0))
+                top = float(obj.get("top", 0))
+                rw = float(obj.get("width", 0)) * float(obj.get("scaleX", 1))
+                rh = float(obj.get("height", 0)) * float(obj.get("scaleY", 1))
+                x1 = max(0, min(image.width, round(left * image.width / canvas_w)))
+                y1 = max(0, min(image.height, round(top * image.height / canvas_h)))
+                x2 = max(0, min(image.width, round((left + rw) * image.width / canvas_w)))
+                y2 = max(0, min(image.height, round((top + rh) * image.height / canvas_h)))
+                if x2 > x1 and y2 > y1:
+                    crop_box = (x1, y1, x2, y2)
+                    st.session_state["crop_box_px"] = crop_box
+            else:
+                crop_box = st.session_state.get("crop_box_px")
 
-        if crop_box:
-            x1, y1, x2, y2 = crop_box
-            roi = image.crop(crop_box)
-            crop_cols = st.columns([1, 1])
-            with crop_cols[0]:
-                st.image(roi, caption="Preview of selected work area", use_container_width=True)
-            with crop_cols[1]:
-                st.write(f"**Crop size:** {x2-x1} × {y2-y1} pixels")
-                if ra and rb and math.hypot(rb[0]-ra[0], rb[1]-ra[1]) >= 1:
-                    px_span = math.hypot(rb[0]-ra[0], rb[1]-ra[1])
-                    cm_per_px = float(known_distance) / px_span
-                    st.write(f"**Approx. width:** {(x2-x1)*cm_per_px:.3f} cm")
-                    st.write(f"**Approx. height:** {(y2-y1)*cm_per_px:.3f} cm")
-                    st.caption("Approximate physical dimensions assume the same scale in both image directions.")
-                else:
-                    st.warning("Mark Reference A and B and enter their real distance to show crop dimensions in cm.")
-                if st.button("Use this box as the inspection crop", key="use_workarea_crop", use_container_width=True):
-                    st.session_state["manual_workarea_crop"] = roi
-                    st.success("Work-area crop saved for preview. Select a target below to inspect an individual solder joint.")
-        else:
-            st.caption("No rectangle yet. Draw one on the image above.")
+            if crop_box:
+                x1, y1, x2, y2 = crop_box
+                roi = image.crop(crop_box)
+                crop_cols = st.columns([1, 1])
+                with crop_cols[0]:
+                    st.image(roi, caption="Selected crop preview", use_container_width=True)
+                with crop_cols[1]:
+                    crop_w_px, crop_h_px = x2 - x1, y2 - y1
+                    st.write(f"**Crop position:** left {x1}px, top {y1}px")
+                    st.write(f"**Crop size:** {crop_w_px} × {crop_h_px} pixels")
+                    if board_width_cm > 0:
+                        st.write(f"**Estimated crop width:** {crop_w_px / image.width * board_width_cm:.3f} cm")
+                    if board_height_cm > 0:
+                        st.write(f"**Estimated crop height:** {crop_h_px / image.height * board_height_cm:.3f} cm")
+                    if board_width_cm <= 0 and board_height_cm <= 0:
+                        st.caption("Enter the real PCB width and/or height above to estimate crop dimensions in cm.")
+                    if st.button("Inspect this drawn crop", key="use_workarea_crop", type="primary", use_container_width=True):
+                        crop_client = new_client()
+                        if crop_client is None:
+                            st.error("Add GEMINI_API_KEY to Streamlit Secrets or the server environment before inspecting.")
+                        else:
+                            with st.spinner("Inspecting the selected work-area crop…"):
+                                try:
+                                    report, verifier = run_inspection(crop_client, model_name, roi, enhanced_review)
+                                    st.session_state["inspection"] = report
+                                    st.session_state["verifier"] = verifier
+                                    st.session_state["report"] = {
+                                        "application": APP_NAME,
+                                        "image_filename": uploaded.name,
+                                        "inspected_at_utc": datetime.now(timezone.utc).isoformat(),
+                                        "joint_id": "drawn work-area crop",
+                                        "crop_box_pixels": {"left": x1, "top": y1, "right": x2, "bottom": y2},
+                                        "assessment": report,
+                                        "second_review": verifier,
+                                    }
+                                    st.session_state["inspection_source"] = "drawn crop"
+                                    st.success("Inspection complete. See the report below.")
+                                except Exception as exc:
+                                    st.error(f"Inspection failed: {str(exc)[:600]}")
+            else:
+                st.caption("No rectangle yet. Drag on the image to draw your work area.")
+        except TypeError as exc:
+            st.error("The crop drawing component failed to initialize. Update the drawable-canvas dependency and restart the app.")
+            st.code(str(exc))
+            st.caption("As a fallback, use the Manual crop selection controls below.")
+        except Exception as exc:
+            st.error("Could not open the interactive crop canvas.")
+            st.code(f"{type(exc).__name__}: {exc}")
+            st.caption("As a fallback, use the Manual crop selection controls below.")
     else:
         st.warning("Interactive crop drawing is unavailable. Install the updated requirements and restart the app.")
-        st.caption("The manual pixel crop below remains available as a fallback.")
+        st.caption("As a fallback, use the Manual crop selection controls below.")
 
-    if st.session_state.get("cal_targets"):
-        st.markdown("**Step 3 · Select a marked target to inspect**")
-        target_options = {
-            f"{p['label']} · pixel ({p['px_x']}, {p['px_y']})": p
-            for p in st.session_state["cal_targets"]
-        }
-        chosen_label = st.selectbox("Which marked solder target should SolderSight inspect?",
-                                    list(target_options.keys()), key="xy_inspection_target")
-        chosen_target = target_options[chosen_label]
-        max_crop = max(80, min(900, max(image.width, image.height)))
-        crop_side = st.slider("Inspection crop size (pixels)", min_value=80, max_value=max_crop,
-                              value=min(360, max_crop), step=20,
-                              help="The crop is centered on your marked point. Include the joint and neighboring pads.")
-        target_crop = crop_around_target(image, (chosen_target["px_x"], chosen_target["px_y"]), crop_side)
-        prev_col, action_col = st.columns([1, 1], gap="large")
-        with prev_col:
-            st.image(target_crop, caption=f"Inspection preview: {chosen_target['label']}", use_container_width=True)
-        with action_col:
-            st.write(f"**Selected target:** {chosen_target['label']}")
-            if ra and rb and pixel_distance >= 1:
-                target_row = next((r for r in rows if r["Target"] == chosen_target["label"]), None)
-                if target_row:
-                    st.write(f"**X:** {target_row['X (cm)']:.4f} cm")
-                    st.write(f"**Y:** {target_row['Y (cm)']:.4f} cm")
-            st.caption("Check the crop before starting the visual review.")
-            if st.button("Inspect this marked target", type="primary", use_container_width=True,
-                         key="inspect_marked_xy_target"):
-                target_client = new_client()
-                if target_client is None:
-                    st.error("Add GEMINI_API_KEY to Streamlit Secrets or the server environment before inspecting.")
-                else:
-                    with st.spinner("Inspecting the marked solder target…"):
-                        try:
-                            report, verifier = run_inspection(target_client, model_name, target_crop, enhanced_review)
-                            st.session_state["inspection"] = report
-                            st.session_state["verifier"] = verifier
-                            st.session_state["report"] = {
-                                "application": APP_NAME,
-                                "image_filename": uploaded.name,
-                                "inspected_at_utc": datetime.now(timezone.utc).isoformat(),
-                                "joint_id": chosen_target["label"],
-                                "target_pixel": {"x": chosen_target["px_x"], "y": chosen_target["px_y"]},
-                                "assessment": report,
-                                "second_review": verifier,
-                            }
-                            st.session_state["inspection_source"] = "marked target"
-                            st.success(f"Inspection complete for {chosen_target['label']}. See the report below.")
-                        except Exception as exc:
-                            st.error(f"Inspection failed: {str(exc)[:600]}")
-
-    st.caption("Calibration assumes a flat PCB, consistent scale, and minimal perspective distortion. For machine use, camera-to-robot calibration, homing, tool-tip offsets, axis/sign validation, and physical safety interlocks are also required. This app does not command hardware.")
     # -----------------------------------------------------------------------------
 
     with st.expander("Image quality checklist", expanded=False):
@@ -740,10 +607,10 @@ if uploaded:
         with st.expander("Manual crop selection", expanded=not bool(joints)):
             st.caption("Use this when the automatic boxes miss the joint. Adjust the rectangle in image-pixel coordinates.")
             a,b,c,d = st.columns(4)
-            x = a.number_input("Left (px)", min_value=0, max_value=max(0,image.width-1), value=0, step=max(1,image.width//20))
-            y = b.number_input("Top (px)", min_value=0, max_value=max(0,image.height-1), value=0, step=max(1,image.height//20))
-            cw = c.number_input("Width (px)", min_value=1, max_value=image.width, value=max(1,image.width//4), step=max(1,image.width//20))
-            ch = d.number_input("Height (px)", min_value=1, max_value=image.height, value=max(1,image.height//4), step=max(1,image.height//20))
+            x = a.number_input("Left (px)", min_value=0, max_value=max(0,image.width-1), value=int(st.session_state.get("crop_box_px", (0, 0, max(1,image.width//4), max(1,image.height//4)))[0]), step=max(1,image.width//20))
+            y = b.number_input("Top (px)", min_value=0, max_value=max(0,image.height-1), value=int(st.session_state.get("crop_box_px", (0, 0, max(1,image.width//4), max(1,image.height//4)))[1]), step=max(1,image.height//20))
+            cw = c.number_input("Width (px)", min_value=1, max_value=image.width, value=max(1, min(image.width, int(st.session_state.get("crop_box_px", (0, 0, max(1,image.width//4), max(1,image.height//4)))[2] - st.session_state.get("crop_box_px", (0, 0, max(1,image.width//4), max(1,image.height//4)))[0]))), step=max(1,image.width//20))
+            ch = d.number_input("Height (px)", min_value=1, max_value=image.height, value=max(1, min(image.height, int(st.session_state.get("crop_box_px", (0, 0, max(1,image.width//4), max(1,image.height//4)))[3] - st.session_state.get("crop_box_px", (0, 0, max(1,image.width//4), max(1,image.height//4)))[1]))), step=max(1,image.height//20))
             mx,my = min(image.width,int(x+cw)), min(image.height,int(y+ch))
             manual_crop = image.crop((int(x),int(y),mx,my))
             st.image(manual_crop, caption="Manual crop preview", width=520)

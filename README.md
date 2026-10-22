@@ -1,60 +1,52 @@
-# SolderSight Playground
+# SolderSight — PCB image crop and solder inspection
 
-A Streamlit playground for AI-assisted visual review of PCB solder joints, with image upload and live-camera capture.
+SolderSight is a Streamlit app for AI-assisted visual solder-joint review. The image workflow is intentionally simple: upload a PCB photo, draw a rectangle around the work area, preview the crop, and inspect it. No reference-point calibration step is required.
 
 ## Features
 
-- White/light themed inspection workspace.
-- Upload an image or capture one with `st.camera_input`.
-- Automatic orientation normalization, resizing to at most 1400 px, and JPEG compression before analysis.
-- One initial vision request assesses solder quality directly; optional second opinion is disabled by default.
-- Structured report with quality, visible findings, confidence, image quality, limitations, and recommended action.
-- Retry logic with exponential backoff and jitter for temporary service errors such as 503, 429, and 5xx.
-- Optional fallback models after repeated overload errors.
-- JSON report download.
+- Upload a PCB image and draw a rectangle directly on it to select a work area.
+- Preview the selected crop and see its pixel coordinates and dimensions.
+- Optionally enter the full PCB's real width and/or height in centimetres to estimate the crop's physical dimensions.
+- Inspect the drawn crop with the configured Gemini vision model.
+- Use the existing candidate-joint inspection workflow when you want AI-assisted candidate regions.
+- Optional independent second review and JSON inspection report download.
+- Primary model defaults to `gemini-3.8-flash`; on request failures, the app tries `gemini-3.5-flash` as fallback. Model IDs/access vary by API project; edit the model fields/constants if your key uses different IDs.
 
-## Setup
+## Run locally
 
 Python 3.11+ recommended.
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate
-# Windows: .venv\Scripts\activate
+source .venv/bin/activate       # macOS/Linux
+# .venv\\Scripts\\activate    # Windows
 pip install -r requirements.txt
-```
-
-Configure your Gemini API key through an environment variable:
-
-```bash
-export GEMINI_API_KEY="YOUR_API_KEY"  # macOS/Linux
-# PowerShell: $env:GEMINI_API_KEY="YOUR_API_KEY"
-```
-
-Or create `.streamlit/secrets.toml` locally:
-
-```toml
-GEMINI_API_KEY = "YOUR_API_KEY"
-```
-
-Never commit API keys or secrets to Git.
-
-Run the app:
-
-```bash
+export GEMINI_API_KEY="YOUR_KEY"   # macOS/Linux
+# PowerShell: $env:GEMINI_API_KEY="YOUR_KEY"
 streamlit run app.py
 ```
 
-## Model and fallback behavior
+Or configure `.streamlit/secrets.toml`:
 
-The default model ID is `gemini-flash-latest`, but model access differs by API key and project. Click **Discover available models** in the sidebar to query the Models API and choose a model returned for your key. The app filters for Gemini-family models supporting `generateContent` and excludes clearly non-vision tasks; confirm that the selected model supports image input in your Google AI Studio project. Set `SOLDERSIGHT_MODEL` or use the manual model ID field to override the default. When fallback is enabled, the app prefers discovered models and otherwise tries configurable candidates from `FALLBACK_MODELS`.
+```toml
+GEMINI_API_KEY = "YOUR_KEY"
+```
 
-Transient errors are retried up to three times per model with exponential backoff and jitter. A missing/unsupported model can trigger a fallback attempt, but invalid keys and permission errors are not hidden. Model discovery depends on the API key having permission to list models. Retries cannot guarantee availability; if the provider remains unavailable, the app shows a friendly error and lets you retry without re-uploading the image.
+Never commit API keys or secrets files.
 
-## Deployment
+## Work-area crop workflow
 
-Deploy to Streamlit Community Cloud by uploading `app.py`, `requirements.txt`, `README.md`, and `.gitignore`. Add `GEMINI_API_KEY` in the app's deployment secrets. Never include the key in the repository.
+1. Upload a clear PCB image.
+2. Drag on the image to draw a rectangle around the region you want to work on.
+3. Review the crop preview and pixel dimensions.
+4. Optionally enter the full PCB width and/or height in centimetres. The app estimates crop width/height using the corresponding image dimension; use a straight-on image for the best estimate.
+5. Click **Inspect this drawn crop** to run the visual review on the selected region.
 
-## Limitations and privacy
+If the drawing component fails to load, update dependencies with `pip install -r requirements.txt` and restart Streamlit. The app displays a fallback message and the existing manual crop controls remain available.
 
-Images are sent to the configured external vision API. Do not upload confidential board images unless your data policy permits it. Visual analysis cannot confirm electrical continuity, hidden solder bridges, internal wetting, or mechanical strength. Validate with expert-labelled images before relying on results for production.
+## Important limitations
+
+- The crop is an image selection only; it does not move or control hardware.
+- Centimetre dimensions are estimates based on the entered full-board dimensions and assume the image represents the board without significant perspective distortion.
+- Visual analysis cannot prove electrical continuity, hidden defects, or mechanical strength. Validate on representative boards before relying on results.
+- Uploaded images are sent to the configured third-party Gemini API for visual inspection. Do not upload confidential images unless your data policy permits it.
