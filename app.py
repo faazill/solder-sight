@@ -106,6 +106,38 @@ def normalize_image(img: Image.Image) -> Image.Image:
     img.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.Resampling.LANCZOS)
     return img
 
+
+def click_to_image_pixel(click_value: dict, image: Image.Image):
+    """Map rendered image-click coordinates back to the normalized source image."""
+    try:
+        x, y = float(click_value["x"]), float(click_value["y"])
+        dw = float(click_value.get("width") or image.width)
+        dh = float(click_value.get("height") or image.height)
+        if dw <= 0 or dh <= 0:
+            return None
+        px = round(x * image.width / dw)
+        py = round(y * image.height / dh)
+        return (max(0, min(image.width - 1, px)),
+                max(0, min(image.height - 1, py)))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def crop_around_target(image: Image.Image, point, side_px: int):
+    """Return a crop centered on a selected target, clipped to the image bounds."""
+    side_px = max(40, int(side_px))
+    cx, cy = int(point[0]), int(point[1])
+    half = side_px // 2
+    left, top = max(0, cx-half), max(0, cy-half)
+    right, bottom = min(image.width, cx+half), min(image.height, cy+half)
+    if right-left < side_px:
+        if left == 0: right = min(image.width, side_px)
+        else: left = max(0, image.width-side_px)
+    if bottom-top < side_px:
+        if top == 0: bottom = min(image.height, side_px)
+        else: top = max(0, image.height-side_px)
+    return image.crop((left, top, right, bottom))
+
 def as_part(img: Image.Image):
     buffer = io.BytesIO()
     img.save(buffer, format="JPEG", quality=94, optimize=True)
@@ -352,9 +384,9 @@ if uploaded:
 
     # ---------------- XY coordinate calibration / target planning ----------------
     st.markdown("---")
-    st.markdown('<div class="section-title">PCB XY coordinate planner</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Step 1 of 3 · Calibrate and mark solder targets</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="section-help">Mark two reference points with a known real-world distance, then mark target solder locations. Coordinates are calculated in centimetres relative to reference A.</div>',
+        '<div class="section-help">Click two measured reference points on the photo, enter their real distance, then click the solder locations you want to inspect.</div>',
         unsafe_allow_html=True,
     )
     st.info(
@@ -375,15 +407,17 @@ if uploaded:
 
     st.markdown("**Step 1 · Mark the reference points**")
     if click_picker_available:
-        st.caption("Click the PCB image to capture a point, then use the buttons below to save that click as Reference A, Reference B, or a solder target.")
+        st.caption("Click the image to select a point. Then save it as Reference A, Reference B, or a target. Click positions are scaled back to the source-image pixels.")
         click_value = streamlit_image_coordinates(image, key=f"xy_picker_{image_key}")
         if click_value and "x" in click_value and "y" in click_value:
-            st.session_state["cal_clicked"] = (int(click_value["x"]), int(click_value["y"]))
+            mapped_point = click_to_image_pixel(click_value, image)
+            if mapped_point:
+                st.session_state["cal_clicked"] = mapped_point
         if st.session_state.get("cal_clicked"):
             cx, cy = st.session_state["cal_clicked"]
-            st.caption(f"Last clicked pixel: x = {cx}, y = {cy}")
+            st.info(f"Selected image point: **({cx}, {cy}) px**. Save it as Reference A, Reference B, or a target below.")
     else:
-        st.warning("Image-click support is unavailable. Enter pixel coordinates manually below; the coordinate calculations are the same.")
+        st.error("Image-click support is unavailable. Install dependencies with `pip install -r requirements.txt` and restart Streamlit. A manual pixel-entry fallback is shown below.")
         p1, p2 = st.columns(2)
         with p1:
             fallback_x = st.number_input("Clicked X pixel", min_value=0, max_value=image.width-1, value=0, key="fallback_click_x")
@@ -404,10 +438,10 @@ if uploaded:
             st.session_state["cal_targets"].append({"label": target_label.strip() or f"Target {len(st.session_state['cal_targets'])+1}", "px_x": int(point[0]), "px_y": int(point[1])})
 
     known_distance = st.number_input(
-        "Known distance from Reference A to Reference B (cm)", min_value=0.001, value=2.5, step=0.5, format="%.3f",
-        help="Measure between the exact physical points you mark in the image. This distance defines the positive X direction from A to B."
+        "Real distance from Reference A to B (cm)", min_value=0.001, value=25.0, step=0.5, format="%.3f",
+        help="Example: enter 25 if the two exact points you clicked are 25 cm apart in real life. Positive X follows A to B."
     )
-    invert_y = st.checkbox("Invert Y axis", value=False, help="By default, positive Y is perpendicular to A→B in the image-down direction for a horizontal reference line.")
+    invert_y = st.checkbox("Invert Y direction (positive Y points up on the image)", value=False, help="Unchecked means positive Y is perpendicular to A→B in the image-down direction.")
     ra, rb = st.session_state.get("cal_ref_a"), st.session_state.get("cal_ref_b")
     status_cols = st.columns(2)
     status_cols[0].metric("Reference A", f"{ra[0]}, {ra[1]} px" if ra else "Not marked")
@@ -441,9 +475,16 @@ if uploaded:
                 writer.writeheader()
                 writer.writerows(rows)
                 st.download_button("Download XY targets (CSV)", data=csv_buffer.getvalue(), file_name="soldersight_xy_targets.csv", mime="text/csv")
-                if st.button("Clear target points", key="clear_xy_targets"):
-                    st.session_state["cal_targets"] = []
-                    st.rerun()
+                clear_col, undo_col = st.columns(2)
+                with clear_col:
+                    if st.button("Clear all targets", key="clear_xy_targets", use_container_width=True):
+                        st.session_state["cal_targets"] = []
+                        st.rerun()
+                with undo_col:
+                    if st.button("Undo last target", key="undo_xy_target", use_container_width=True,
+                                 disabled=not bool(st.session_state["cal_targets"])):
+                        st.session_state["cal_targets"].pop()
+                        st.rerun()
             else:
                 st.caption("No targets added yet. Click a target location and choose Add clicked target.")
 
@@ -460,8 +501,59 @@ if uploaded:
         x0, y0 = point["px_x"], point["px_y"]
         draw.ellipse((x0-marker_radius, y0-marker_radius, x0+marker_radius, y0+marker_radius), fill=(0, 160, 100), outline=(255,255,255), width=2)
         draw.text((x0+marker_radius+2, max(0,y0-marker_radius-12)), str(idx), fill=(0, 120, 75))
-    st.image(overlay, caption="Coordinate marker preview · blue = A, orange = B, green = target", use_container_width=True)
-    st.caption("For robot use, you still need camera-to-robot calibration, machine homing, tool-tip offsets, axis/sign validation, and physical safety interlocks. Do not send these coordinates to hardware without validating the complete transform.")
+    st.image(overlay, caption="Marked image · blue = Reference A, orange = Reference B, green = solder targets", use_container_width=True)
+
+    if st.session_state.get("cal_targets"):
+        st.markdown("**Step 3 · Select a marked target to inspect**")
+        target_options = {
+            f"{p['label']} · pixel ({p['px_x']}, {p['px_y']})": p
+            for p in st.session_state["cal_targets"]
+        }
+        chosen_label = st.selectbox("Which marked solder target should SolderSight inspect?",
+                                    list(target_options.keys()), key="xy_inspection_target")
+        chosen_target = target_options[chosen_label]
+        max_crop = max(80, min(900, max(image.width, image.height)))
+        crop_side = st.slider("Inspection crop size (pixels)", min_value=80, max_value=max_crop,
+                              value=min(360, max_crop), step=20,
+                              help="The crop is centered on your marked point. Include the joint and neighboring pads.")
+        target_crop = crop_around_target(image, (chosen_target["px_x"], chosen_target["px_y"]), crop_side)
+        prev_col, action_col = st.columns([1, 1], gap="large")
+        with prev_col:
+            st.image(target_crop, caption=f"Inspection preview: {chosen_target['label']}", use_container_width=True)
+        with action_col:
+            st.write(f"**Selected target:** {chosen_target['label']}")
+            if ra and rb and pixel_distance >= 1:
+                target_row = next((r for r in rows if r["Target"] == chosen_target["label"]), None)
+                if target_row:
+                    st.write(f"**X:** {target_row['X (cm)']:.4f} cm")
+                    st.write(f"**Y:** {target_row['Y (cm)']:.4f} cm")
+            st.caption("Check the crop before starting the visual review.")
+            if st.button("Inspect this marked target", type="primary", use_container_width=True,
+                         key="inspect_marked_xy_target"):
+                target_client = new_client()
+                if target_client is None:
+                    st.error("Add GEMINI_API_KEY to Streamlit Secrets or the server environment before inspecting.")
+                else:
+                    with st.spinner("Inspecting the marked solder target…"):
+                        try:
+                            report, verifier = run_inspection(target_client, model_name, target_crop, enhanced_review)
+                            st.session_state["inspection"] = report
+                            st.session_state["verifier"] = verifier
+                            st.session_state["report"] = {
+                                "application": APP_NAME,
+                                "image_filename": uploaded.name,
+                                "inspected_at_utc": datetime.now(timezone.utc).isoformat(),
+                                "joint_id": chosen_target["label"],
+                                "target_pixel": {"x": chosen_target["px_x"], "y": chosen_target["px_y"]},
+                                "assessment": report,
+                                "second_review": verifier,
+                            }
+                            st.session_state["inspection_source"] = "marked target"
+                            st.success(f"Inspection complete for {chosen_target['label']}. See the report below.")
+                        except Exception as exc:
+                            st.error(f"Inspection failed: {str(exc)[:600]}")
+
+    st.caption("Calibration assumes a flat PCB, consistent scale, and minimal perspective distortion. For machine use, camera-to-robot calibration, homing, tool-tip offsets, axis/sign validation, and physical safety interlocks are also required. This app does not command hardware.")
     # -----------------------------------------------------------------------------
 
     with st.expander("Image quality checklist", expanded=False):
