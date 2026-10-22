@@ -1,54 +1,60 @@
-# SolderSight Playground — PCB solder quality review
+# SolderSight Playground
 
-SolderSight is a Streamlit playground for AI-assisted visual review of PCB solder joints. The interface is inspired by modern robotics/AI playgrounds: a focused workspace, input canvas, analysis controls, result panel, and recent-run list.
+A Streamlit playground for AI-assisted visual review of PCB solder joints, with image upload and live-camera capture.
 
 ## Features
 
-- **Upload image** or **Live camera** input.
-- Camera capture through Streamlit's `st.camera_input`; take a photo, preview it, then press **Analyze Solder Quality**.
-- Local image normalization and resizing to a maximum longest dimension of 1400 px, followed by JPEG compression before the image is sent to the vision API.
-- One initial vision request directly assesses the visible solder quality; there is no separate joint-location request.
-- Optional independent second review is available in the sidebar but disabled by default to keep the standard workflow faster.
-- Results include visible quality, joint status, defects and evidence, confidence, image-quality notes, and a recommended next action.
-- JSON inspection report download and recent-run history for the current session.
-- Responsive dark playground-style interface with privacy and system information.
+- White/light themed inspection workspace.
+- Upload an image or capture one with `st.camera_input`.
+- Automatic orientation normalization, resizing to at most 1400 px, and JPEG compression before analysis.
+- One initial vision request assesses solder quality directly; optional second opinion is disabled by default.
+- Structured report with quality, visible findings, confidence, image quality, limitations, and recommended action.
+- Retry logic with exponential backoff and jitter for temporary service errors such as 503, 429, and 5xx.
+- Optional fallback models after repeated overload errors.
+- JSON report download.
 
-## Run locally
+## Setup
 
-Python 3.11+ is recommended.
+Python 3.11+ recommended.
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate       # macOS/Linux
-# .venv\Scripts\activate        # Windows
+source .venv/bin/activate
+# Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Configure your Gemini API key as an environment variable:
+Configure your Gemini API key through an environment variable:
 
 ```bash
-export GEMINI_API_KEY="YOUR_KEY"   # macOS/Linux
-# PowerShell: $env:GEMINI_API_KEY="YOUR_KEY"
+export GEMINI_API_KEY="YOUR_API_KEY"  # macOS/Linux
+# PowerShell: $env:GEMINI_API_KEY="YOUR_API_KEY"
+```
+
+Or create `.streamlit/secrets.toml` locally:
+
+```toml
+GEMINI_API_KEY = "YOUR_API_KEY"
+```
+
+Never commit API keys or secrets to Git.
+
+Run the app:
+
+```bash
 streamlit run app.py
 ```
 
-Alternatively, create `.streamlit/secrets.toml` locally:
+## Model and fallback behavior
 
-```toml
-GEMINI_API_KEY = "YOUR_KEY"
-```
+The default model is `gemini-2.5-flash`. Set `SOLDERSIGHT_MODEL` to change the default model, or use the sidebar field. When fallback is enabled, SolderSight tries `gemini-2.0-flash` after the selected model continues to return transient overload/rate-limit errors. The fallback model must be enabled for your API project and support image input. You can edit `FALLBACK_MODELS` in `app.py` to match models available to your account.
 
-Never commit your API key or secrets file.
+Transient errors are retried up to three times per model with exponential backoff and jitter. Retries cannot guarantee availability; if the provider remains unavailable, the app shows a friendly error and lets you retry without re-uploading the image.
 
-## Deploy to Streamlit Community Cloud
+## Deployment
 
-1. Push `app.py`, `requirements.txt`, `README.md`, and optionally `.gitignore` to a GitHub repository.
-2. Create an app at https://share.streamlit.io and select `app.py` as the entrypoint.
-3. Add `GEMINI_API_KEY` in the app's deployment secrets.
+Deploy to Streamlit Community Cloud by uploading `app.py`, `requirements.txt`, `README.md`, and `.gitignore`. Add `GEMINI_API_KEY` in the app's deployment secrets. Never include the key in the repository.
 
-## Privacy and responsible use
+## Limitations and privacy
 
-- Images are sent to the configured third-party vision API. Do not upload confidential board images unless your data policy permits it.
-- This is visual decision support, not a certified industrial inspection system. Visual analysis cannot prove electrical continuity, hidden defects, internal wetting, or mechanical strength.
-- Validate with representative, expert-labelled images before relying on results operationally.
-- Public deployment may incur API charges. Add authentication, quotas/rate limiting, and monitoring before sharing broadly.
+Images are sent to the configured external vision API. Do not upload confidential board images unless your data policy permits it. Visual analysis cannot confirm electrical continuity, hidden solder bridges, internal wetting, or mechanical strength. Validate with expert-labelled images before relying on results for production.
