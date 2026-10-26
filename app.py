@@ -1,12 +1,23 @@
+"""
+Solder Sight
+Capture or upload a PCB image -> drag a reference box -> enter its real
+width/height -> click joints -> get X/Y in mm from the box's bottom-left corner.
 
+Install:
+    pip install streamlit pillow "streamlit-image-coordinates>=0.2.0"
+
+Run:
+    streamlit run solder_sight.py
+
+Camera note: browsers only allow camera access on https:// or http://localhost.
+"""
+
+import csv
 import hashlib
 import io
 
-import cv2
-import numpy as np
 import streamlit as st
-from PIL import Image, ImageDraw
-from streamlit_drawable_canvas import st_canvas
+from PIL import Image, ImageDraw, ImageFont
 from streamlit_image_coordinates import streamlit_image_coordinates
 
 
@@ -14,25 +25,60 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 # CONFIGURATION
 # =========================================================
 
-st.set_page_config(
-    page_title="Solder Sight",
-    page_icon="🎯",
-    layout="wide",
-)
+st.set_page_config(page_title="Solder Sight", page_icon="🎯", layout="wide")
 
-# All image panels use these fixed dimensions.
-BOX_CANVAS_W = 900
-BOX_CANVAS_H = 560
+PANEL_W = 960
+PANEL_H = 540
+MIN_BOX_PX = 8
 
-CROP_CANVAS_W = 900
-CROP_CANVAS_H = 500
+INK = "#16212B"
+ACCENT = "#0E7C86"
+MARK = (255, 59, 48)
 
-st.title("🎯 Solder Sight")
-st.caption("Draw a work area · Calibrate dimensions · Select solder joints")
+st.markdown(
+    f"""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
 
-st.warning(
-    "This application creates a coordinate table and G-code preview only. "
-    "It does not control your soldering hardware."
+    html, body, [class*="css"], .stApp {{
+        font-family: 'IBM Plex Sans', system-ui, sans-serif;
+        color: {INK};
+    }}
+    .stApp {{ background: #F4F6F7; }}
+    .block-container {{ padding-top: 2rem; max-width: 1200px; }}
+
+    h1, h2, h3 {{ letter-spacing: -0.01em; color: {INK}; }}
+
+    .brand {{ display:flex; align-items:baseline; gap:.75rem; margin-bottom:.25rem; }}
+    .brand .name {{ font-size:1.9rem; font-weight:600; }}
+    .brand .tag {{ color:#5B6B78; font-size:.95rem; }}
+
+    .stepper {{ display:flex; gap:.5rem; margin:1rem 0 1.5rem; }}
+    .step {{
+        flex:1; padding:.7rem .9rem; border-radius:6px;
+        background:#E6EBEE; color:#5B6B78; font-size:.92rem;
+        border-left:4px solid #C5CED4;
+    }}
+    .step b {{ display:block; font-weight:600; }}
+    .step.active {{ background:#fff; color:{INK}; border-left-color:{ACCENT};
+                    box-shadow:0 1px 3px rgba(22,33,43,.12); }}
+    .step.done {{ background:#DCEFF0; color:#0B5A62; border-left-color:{ACCENT}; }}
+
+    .panel {{
+        background:#fff; border:1px solid #D9E0E4; border-radius:8px;
+        padding:1.1rem 1.25rem; margin-bottom:1rem;
+    }}
+    .hint {{ color:#5B6B78; font-size:.92rem; margin:.1rem 0 .8rem; }}
+
+    [data-testid="stMetricValue"] {{ font-family:'IBM Plex Mono', monospace; font-size:1.35rem; }}
+    [data-testid="stSidebar"] {{ background:#fff; border-right:1px solid #D9E0E4; }}
+    .stButton > button[kind="primary"], .stDownloadButton > button {{
+        border-radius:6px; font-weight:500;
+    }}
+    code, pre {{ font-family:'IBM Plex Mono', monospace !important; }}
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 
@@ -40,594 +86,403 @@ st.warning(
 # SESSION STATE
 # =========================================================
 
-STATE_DEFAULTS = {
+DEFAULTS = {
     "image_hash": None,
-    "box_original": None,
+    "image_bytes": None,
+    "box_draft": None,       # (x1, y1, x2, y2) in original pixels, not yet confirmed
+    "box": None,             # confirmed reference box, integer original pixels
     "width_mm": 100.0,
     "height_mm": 60.0,
     "calibrated": False,
-    "targets": [],
-    "last_target_click": None,
+    "cal_id": 0,             # bumps on each calibration so the click widget resets
+    "points": [],            # list of (x, y) in original image pixels
+    "last_click_sig": None,
+    "last_drag_sig": None,
 }
+for k, v in DEFAULTS.items():
+    st.session_state.setdefault(k, v)
 
-for key, value in STATE_DEFAULTS.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
+ss = st.session_state
+
+
+def reset_calibration():
+    ss.box_draft = None
+    ss.box = None
+    ss.calibrated = False
+    ss.points = []
+    ss.last_click_sig = None
+    ss.last_drag_sig = None
 
 
 # =========================================================
-# IMAGE NORMALIZATION
-# Fixed-size image, preserved aspect ratio, centered
+# HELPERS
 # =========================================================
 
-def fit_image(image, canvas_w, canvas_h, background=(35, 35, 35)):
-    """
-    Fit an image into a fixed-size panel without distorting it.
+def get_font(size):
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
 
-    Returns:
-        canvas_image: fixed-size RGB PIL image
-        scale: resize scale from source image to panel
-        offset_x, offset_y: image position within panel
-        displayed_w, displayed_h: fitted image dimensions
-    """
+
+def fit_image(image, w, h, background=(28, 36, 43)):
+    """Fit image into a fixed w x h panel, keeping aspect ratio, centered."""
     image = image.convert("RGB")
-    src_w, src_h = image.size
-
-    scale = min(canvas_w / src_w, canvas_h / src_h)
-
-    displayed_w = max(1, round(src_w * scale))
-    displayed_h = max(1, round(src_h * scale))
-
-    resized = image.resize(
-        (displayed_w, displayed_h),
-        Image.Resampling.LANCZOS,
-    )
-
-    canvas_image = Image.new(
-        "RGB",
-        (canvas_w, canvas_h),
-        background,
-    )
-
-    offset_x = (canvas_w - displayed_w) // 2
-    offset_y = (canvas_h - displayed_h) // 2
-
-    canvas_image.paste(resized, (offset_x, offset_y))
-
-    return (
-        canvas_image,
-        scale,
-        offset_x,
-        offset_y,
-        displayed_w,
-        displayed_h,
-    )
+    sw, sh = image.size
+    scale = min(w / sw, h / sh)
+    dw, dh = max(1, round(sw * scale)), max(1, round(sh * scale))
+    resized = image.resize((dw, dh), Image.Resampling.LANCZOS)
+    panel = Image.new("RGB", (w, h), background)
+    ox, oy = (w - dw) // 2, (h - dh) // 2
+    panel.paste(resized, (ox, oy))
+    return panel, scale, ox, oy, dw, dh
 
 
-def panel_to_original(x, y, scale, offset_x, offset_y):
-    """Convert panel coordinates to original image pixel coordinates."""
-    return (
-        (x - offset_x) / scale,
-        (y - offset_y) / scale,
-    )
+def panel_to_image(x, y, scale, ox, oy):
+    return (x - ox) / scale, (y - oy) / scale
 
 
-def original_to_panel(x, y, scale, offset_x, offset_y):
-    """Convert original image pixels to panel coordinates."""
-    return (
-        x * scale + offset_x,
-        y * scale + offset_y,
-    )
+def image_to_panel(x, y, scale, ox, oy):
+    return x * scale + ox, y * scale + oy
 
 
-def make_annotated_crop(crop, targets, crop_box):
-    """Draw target markers over the original-resolution crop."""
-    result = crop.copy()
-    draw = ImageDraw.Draw(result)
-
-    for index, (x, y) in enumerate(targets, start=1):
-        radius = max(5, min(14, round(min(result.size) * 0.012)))
-
-        draw.ellipse(
-            (
-                x - radius,
-                y - radius,
-                x + radius,
-                y + radius,
-            ),
-            outline="red",
-            width=3,
-        )
-
-        draw.text(
-            (x + radius + 3, y - radius),
-            str(index),
-            fill="red",
-            stroke_width=1,
-            stroke_fill="white",
-        )
-
-    return result
-
-
-# =========================================================
-# PERSPECTIVE TRANSFORM
-# Origin = bottom-left of selected box
-# =========================================================
-
-def make_transform(box, width_mm, height_mm):
+def px_to_mm(point, box, width_mm, height_mm):
+    """Origin = bottom-left of the reference box. X right, Y up."""
     x1, y1, x2, y2 = box
-
-    source = np.array(
-        [
-            [x1, y1],  # top-left
-            [x2, y1],  # top-right
-            [x2, y2],  # bottom-right
-            [x1, y2],  # bottom-left
-        ],
-        dtype=np.float32,
-    )
-
-    destination = np.array(
-        [
-            [0, height_mm],
-            [width_mm, height_mm],
-            [width_mm, 0],
-            [0, 0],
-        ],
-        dtype=np.float32,
-    )
-
-    return cv2.getPerspectiveTransform(source, destination)
+    x_mm = (point[0] - x1) / (x2 - x1) * width_mm
+    y_mm = (y2 - point[1]) / (y2 - y1) * height_mm
+    return x_mm, y_mm
 
 
-def pixel_to_mm(point, transform):
-    point_array = np.array(
-        [[point]],
-        dtype=np.float32,
-    )
-
-    converted = cv2.perspectiveTransform(
-        point_array,
-        transform,
-    )
-
-    return (
-        float(converted[0][0][0]),
-        float(converted[0][0][1]),
-    )
+def stepper(stage):
+    names = [
+        ("Capture image", "Camera or file"),
+        ("Reference box", "Drag and set size"),
+        ("Pick joints", "Click to measure"),
+    ]
+    html = '<div class="stepper">'
+    for i, (title, sub) in enumerate(names, start=1):
+        cls = "done" if i < stage else "active" if i == stage else ""
+        html += f'<div class="step {cls}"><b>{i}. {title}</b>{sub}</div>'
+    html += "</div>"
+    st.markdown(html, unsafe_allow_html=True)
 
 
 # =========================================================
-# POPUP FOR BOX DIMENSIONS
+# HEADER
 # =========================================================
 
-@st.dialog("Set work-area dimensions")
-def dimensions_popup(box):
-    st.write(
-        "Enter the actual physical dimensions of the rectangular "
-        "area you selected."
-    )
-
-    with st.form("dimensions_form"):
-        width = st.number_input(
-            "Box width (mm)",
-            min_value=0.1,
-            max_value=10000.0,
-            value=float(st.session_state.width_mm),
-            step=1.0,
-        )
-
-        height = st.number_input(
-            "Box height (mm)",
-            min_value=0.1,
-            max_value=10000.0,
-            value=float(st.session_state.height_mm),
-            step=1.0,
-        )
-
-        submitted = st.form_submit_button(
-            "Confirm dimensions",
-            type="primary",
-            use_container_width=True,
-        )
-
-    if submitted:
-        st.session_state.box_original = box
-        st.session_state.width_mm = float(width)
-        st.session_state.height_mm = float(height)
-        st.session_state.calibrated = True
-        st.session_state.targets = []
-        st.session_state.last_target_click = None
-        st.rerun()
-
-
-# =========================================================
-# UPLOAD IMAGE
-# =========================================================
-
-st.subheader("1. Upload PCB image")
-
-uploaded = st.file_uploader(
-    "Choose an image",
-    type=["png", "jpg", "jpeg", "webp", "bmp"],
+st.markdown(
+    '<div class="brand"><span class="name">Solder Sight</span>'
+    '<span class="tag">Measure solder-joint positions from a reference box</span></div>',
+    unsafe_allow_html=True,
+)
+st.caption(
+    "Creates a coordinate table and G-code preview only. "
+    "It does not control any soldering hardware."
 )
 
-if uploaded is None:
-    st.info("Upload a PCB image to start.")
+stage = 1
+if ss.image_bytes is not None:
+    stage = 3 if ss.calibrated else 2
+stepper(stage)
+
+
+# =========================================================
+# STEP 1: CAPTURE OR UPLOAD
+# =========================================================
+
+with st.container():
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.subheader("1. Capture image")
+
+    source = st.radio(
+        "Image source",
+        ["Camera", "Upload file"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    new_bytes = None
+    if source == "Camera":
+        st.markdown(
+            '<div class="hint">Allow camera access when your browser asks, '
+            "then take a photo. Keep the camera steady and facing the board "
+            "straight on.</div>",
+            unsafe_allow_html=True,
+        )
+        shot = st.camera_input("Camera", label_visibility="collapsed")
+        if shot is not None:
+            new_bytes = shot.getvalue()
+    else:
+        up = st.file_uploader(
+            "Image file",
+            type=["png", "jpg", "jpeg", "webp", "bmp"],
+            label_visibility="collapsed",
+        )
+        if up is not None:
+            new_bytes = up.getvalue()
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+if new_bytes is not None:
+    h = hashlib.sha256(new_bytes).hexdigest()
+    if h != ss.image_hash:
+        ss.image_hash = h
+        ss.image_bytes = new_bytes
+        reset_calibration()
+        st.rerun()
+
+if ss.image_bytes is None:
+    st.info("Take a photo or upload an image to start.")
     st.stop()
 
 try:
-    original_image = Image.open(
-        io.BytesIO(uploaded.getvalue())
-    ).convert("RGB")
+    image = Image.open(io.BytesIO(ss.image_bytes)).convert("RGB")
 except Exception:
-    st.error("The uploaded file could not be opened as an image.")
+    st.error("This file could not be opened as an image. Try another one.")
     st.stop()
 
-original_w, original_h = original_image.size
-
-image_hash = hashlib.sha256(
-    uploaded.getvalue()
-).hexdigest()
-
-if st.session_state.image_hash != image_hash:
-    st.session_state.image_hash = image_hash
-    st.session_state.box_original = None
-    st.session_state.calibrated = False
-    st.session_state.targets = []
-    st.session_state.last_target_click = None
-
-st.caption(
-    f"Original resolution: {original_w} × {original_h} pixels"
-)
+img_w, img_h = image.size
+image_hash = ss.image_hash
 
 
 # =========================================================
-# DRAW THE BOX
+# SIDEBAR
 # =========================================================
 
-if not st.session_state.calibrated:
+with st.sidebar:
+    st.header("Session")
+    st.metric("Image", f"{img_w} × {img_h} px")
+    if ss.calibrated:
+        st.metric("Reference box", f"{ss.width_mm:g} × {ss.height_mm:g} mm")
+    st.metric("Points", len(ss.points))
 
-    st.subheader("2. Draw the work-area box")
-
-    st.write(
-        "Drag from one corner to the opposite corner around the PCB area "
-        "you want to work on. The image panel has a fixed size; the image "
-        "itself keeps its aspect ratio."
+    st.divider()
+    st.markdown(
+        "**Coordinate system**  \n"
+        "Origin (0, 0) is the **bottom-left** corner of the reference box. "
+        "X increases to the right, Y increases upward."
     )
 
-    box_panel, box_scale, box_off_x, box_off_y, _, _ = fit_image(
-        original_image,
-        BOX_CANVAS_W,
-        BOX_CANVAS_H,
+    st.divider()
+    if ss.calibrated:
+        if st.button("Undo last point", disabled=not ss.points):
+            ss.points.pop()
+            st.rerun()
+        if st.button("Clear all points", disabled=not ss.points):
+            ss.points = []
+            ss.last_click_sig = None
+            st.rerun()
+        if st.button("Redraw reference box"):
+            reset_calibration()
+            st.rerun()
+
+
+# =========================================================
+# STEP 2: DRAW REFERENCE BOX
+# =========================================================
+
+if not ss.calibrated:
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.subheader("2. Draw the reference box")
+    st.markdown(
+        '<div class="hint">Drag from one corner to the opposite corner around '
+        "an object of known size (the PCB, or a ruler-marked rectangle). "
+        "Then enter its real width and height.</div>",
+        unsafe_allow_html=True,
     )
 
-    canvas_background = box_panel.convert("RGBA")
+    panel, scale, ox, oy, dw, dh = fit_image(image, PANEL_W, PANEL_H)
 
-    canvas_result = st_canvas(
-        fill_color="rgba(0, 180, 255, 0.15)",
-        stroke_width=2,
-        stroke_color="#00B4FF",
-        background_image=canvas_background,
-        update_streamlit=True,
-        height=BOX_CANVAS_H,
-        width=BOX_CANVAS_W,
-        drawing_mode="rect",
-        display_toolbar=True,
-        key=f"rectangle_canvas_{image_hash}",
-    )
+    if ss.box_draft is not None:
+        d = ImageDraw.Draw(panel, "RGBA")
+        bx1, by1, bx2, by2 = ss.box_draft
+        p1 = image_to_panel(bx1, by1, scale, ox, oy)
+        p2 = image_to_panel(bx2, by2, scale, ox, oy)
+        d.rectangle((*p1, *p2), fill=(14, 124, 134, 50), outline=(14, 200, 214, 255), width=3)
+        # origin marker at bottom-left of the box
+        cx, cy = p1[0], p2[1]
+        d.ellipse((cx - 7, cy - 7, cx + 7, cy + 7), fill=(255, 59, 48, 255), outline="white", width=2)
+        d.text((cx + 12, cy - 22), "Origin (0, 0)", fill="white", font=get_font(15),
+               stroke_width=2, stroke_fill=(0, 0, 0))
 
-    if st.button("Reset box drawing"):
-        st.session_state.box_original = None
-        st.session_state.calibrated = False
+    try:
+        drag = streamlit_image_coordinates(
+            panel,
+            key=f"box_drag_{image_hash}",
+            click_and_drag=True,
+        )
+    except TypeError:
+        st.error(
+            "Box drawing needs a newer component. Run: "
+            'pip install -U "streamlit-image-coordinates>=0.2.0"'
+        )
+        st.stop()
+
+    if drag and all(k in drag for k in ("x1", "y1", "x2", "y2")):
+        sig = (drag["x1"], drag["y1"], drag["x2"], drag["y2"])
+        if sig != ss.last_drag_sig:
+            ss.last_drag_sig = sig
+            ax, ay = panel_to_image(min(sig[0], sig[2]), min(sig[1], sig[3]), scale, ox, oy)
+            bx, by = panel_to_image(max(sig[0], sig[2]), max(sig[1], sig[3]), scale, ox, oy)
+            ax, bx = (max(0.0, min(img_w - 1.0, v)) for v in (ax, bx))
+            ay, by = (max(0.0, min(img_h - 1.0, v)) for v in (ay, by))
+            if bx - ax >= MIN_BOX_PX and by - ay >= MIN_BOX_PX:
+                ss.box_draft = (ax, ay, bx, by)
+                st.rerun()
+            else:
+                st.warning("That box is too small. Drag a larger rectangle.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.subheader("Reference size")
+    c1, c2, c3 = st.columns([1, 1, 1.2])
+    width_mm = c1.number_input("Box width (mm)", 0.1, 10000.0, float(ss.width_mm), 1.0)
+    height_mm = c2.number_input("Box height (mm)", 0.1, 10000.0, float(ss.height_mm), 1.0)
+
+    c3.markdown("&nbsp;", unsafe_allow_html=True)
+    if c3.button("Confirm reference box", type="primary", disabled=ss.box_draft is None):
+        ss.box = tuple(int(round(v)) for v in ss.box_draft)
+        ss.width_mm = float(width_mm)
+        ss.height_mm = float(height_mm)
+        ss.calibrated = True
+        ss.cal_id += 1
+        ss.points = []
+        ss.last_click_sig = None
         st.rerun()
 
-    rectangle = None
-
-    if (
-        canvas_result.json_data is not None
-        and canvas_result.json_data.get("objects")
-    ):
-        objects = canvas_result.json_data["objects"]
-
-        rectangles = [
-            obj for obj in objects
-            if obj.get("type") == "rect"
-        ]
-
-        if rectangles:
-            # Use the most recently drawn rectangle.
-            obj = rectangles[-1]
-
-            left = float(obj.get("left", 0))
-            top = float(obj.get("top", 0))
-            rect_w = float(obj.get("width", 0)) * float(
-                obj.get("scaleX", 1)
-            )
-            rect_h = float(obj.get("height", 0)) * float(
-                obj.get("scaleY", 1)
-            )
-
-            # Rectangle coordinates in the panel.
-            px1 = min(left, left + rect_w)
-            py1 = min(top, top + rect_h)
-            px2 = max(left, left + rect_w)
-            py2 = max(top, top + rect_h)
-
-            # Map panel coordinates back to the original image.
-            ox1, oy1 = panel_to_original(
-                px1, py1, box_scale, box_off_x, box_off_y
-            )
-            ox2, oy2 = panel_to_original(
-                px2, py2, box_scale, box_off_x, box_off_y
-            )
-
-            # Clip box to image boundaries.
-            ox1 = max(0.0, min(float(original_w - 1), ox1))
-            ox2 = max(0.0, min(float(original_w - 1), ox2))
-            oy1 = max(0.0, min(float(original_h - 1), oy1))
-            oy2 = max(0.0, min(float(original_h - 1), oy2))
-
-            if ox2 - ox1 >= 5 and oy2 - oy1 >= 5:
-                rectangle = (ox1, oy1, ox2, oy2)
-
-    if rectangle is not None:
-        st.success("Rectangle detected.")
-
-        x1, y1, x2, y2 = rectangle
-        preview = original_image.copy()
-        draw = ImageDraw.Draw(preview)
-        draw.rectangle((x1, y1, x2, y2), outline="cyan", width=5)
-
-        preview_panel, _, _, _, _, _ = fit_image(
-            preview,
-            BOX_CANVAS_W,
-            BOX_CANVAS_H,
-        )
-
-        st.image(
-            preview_panel,
-            caption="Preview of the selected box",
-            use_container_width=False,
-        )
-
-        if st.button(
-            "Set box width and height",
-            type="primary",
-            use_container_width=True,
-        ):
-            dimensions_popup(rectangle)
-
+    if ss.box_draft is None:
+        st.caption("Draw a box on the image to enable this button.")
+    st.markdown("</div>", unsafe_allow_html=True)
     st.stop()
 
 
 # =========================================================
-# CALIBRATED CROP
+# STEP 3: PICK POINTS INSIDE THE BOX
 # =========================================================
 
-box = st.session_state.box_original
-x1, y1, x2, y2 = box
-
-# Crop the selected region from the original-resolution image.
-crop = original_image.crop(
-    (
-        int(round(x1)),
-        int(round(y1)),
-        int(round(x2)),
-        int(round(y2)),
-    )
-)
+x1, y1, x2, y2 = ss.box
+crop = image.crop((x1, y1, x2, y2))
 
 if crop.width < 2 or crop.height < 2:
-    st.error("The selected box is too small. Reset and draw it again.")
-    st.session_state.calibrated = False
+    st.error("The reference box is too small. Redraw it from the sidebar.")
     st.stop()
 
-st.subheader("3. Selected work area")
-
-dim_col1, dim_col2, dim_col3 = st.columns(3)
-
-dim_col1.metric("Box width", f"{st.session_state.width_mm:.2f} mm")
-dim_col2.metric("Box height", f"{st.session_state.height_mm:.2f} mm")
-dim_col3.metric("Crop resolution", f"{crop.width} × {crop.height} px")
-
-if st.button("Redraw box / change dimensions"):
-    st.session_state.calibrated = False
-    st.session_state.box_original = None
-    st.session_state.targets = []
-    st.session_state.last_target_click = None
-    st.rerun()
-
-
-# =========================================================
-# TARGET POINT SELECTION
-# =========================================================
-
-st.subheader("4. Select candidate solder joints")
-
-st.write(
-    "Click a solder joint in the crop, then press **Add target point**. "
-    "Coordinates are measured from the bottom-left of the selected box."
+st.markdown('<div class="panel">', unsafe_allow_html=True)
+st.subheader("3. Pick solder joints")
+st.markdown(
+    '<div class="hint">Click a joint to add it. Each click is measured in mm '
+    "from the bottom-left corner of the reference box (red origin marker).</div>",
+    unsafe_allow_html=True,
 )
 
-crop_panel, crop_scale, crop_off_x, crop_off_y, _, _ = fit_image(
-    crop,
-    CROP_CANVAS_W,
-    CROP_CANVAS_H,
-)
+crop_panel, c_scale, c_ox, c_oy, c_dw, c_dh = fit_image(crop, PANEL_W, PANEL_H)
+d = ImageDraw.Draw(crop_panel, "RGBA")
 
-annotated_crop = make_annotated_crop(
-    crop,
-    st.session_state.targets,
-    box,
-)
+# Axes at the origin (bottom-left of the displayed crop)
+org_x, org_y = c_ox, c_oy + c_dh
+arm = 70
+d.line((org_x, org_y, org_x + arm, org_y), fill=(255, 59, 48, 255), width=3)
+d.line((org_x, org_y, org_x, org_y - arm), fill=(52, 199, 89, 255), width=3)
+d.ellipse((org_x - 6, org_y - 6, org_x + 6, org_y + 6), fill=(255, 255, 255, 255), outline=(0, 0, 0, 255))
+f_small = get_font(14)
+d.text((org_x + arm + 6, org_y - 18), "X", fill="white", font=f_small, stroke_width=2, stroke_fill=(0, 0, 0))
+d.text((org_x + 8, org_y - arm - 20), "Y", fill="white", font=f_small, stroke_width=2, stroke_fill=(0, 0, 0))
 
-crop_panel, crop_scale, crop_off_x, crop_off_y, _, _ = fit_image(
-    annotated_crop,
-    CROP_CANVAS_W,
-    CROP_CANVAS_H,
-)
+# Point markers
+f_pt = get_font(16)
+for i, (px, py) in enumerate(ss.points, start=1):
+    cx, cy = image_to_panel(px - x1, py - y1, c_scale, c_ox, c_oy)
+    d.ellipse((cx - 9, cy - 9, cx + 9, cy + 9), outline=MARK + (255,), width=3)
+    d.line((cx - 4, cy, cx + 4, cy), fill=MARK + (255,), width=2)
+    d.line((cx, cy - 4, cx, cy + 4), fill=MARK + (255,), width=2)
+    d.text((cx + 13, cy - 20), str(i), fill="white", font=f_pt, stroke_width=2, stroke_fill=(0, 0, 0))
 
-selected_crop_pixel = None
+click = streamlit_image_coordinates(crop_panel, key=f"pick_{image_hash}_{ss.cal_id}")
 
-click_result = streamlit_image_coordinates(
-    crop_panel,
-    key=f"target_picker_{image_hash}_{len(st.session_state.targets)}",
-)
+if click:
+    sig = (click.get("x"), click.get("y"), click.get("unix_time"))
+    if sig != ss.last_click_sig:
+        ss.last_click_sig = sig
+        cx_img, cy_img = panel_to_image(click["x"], click["y"], c_scale, c_ox, c_oy)
+        if 0 <= cx_img < crop.width and 0 <= cy_img < crop.height:
+            ss.points.append((x1 + cx_img, y1 + cy_img))
+            st.rerun()
+        else:
+            st.warning("That click was outside the reference box.")
 
-if click_result is not None:
-    click_x = float(click_result["x"])
-    click_y = float(click_result["y"])
-
-    # Convert panel coordinates into crop-image pixels.
-    crop_x, crop_y = panel_to_original(
-        click_x,
-        click_y,
-        crop_scale,
-        crop_off_x,
-        crop_off_y,
-    )
-
-    if (
-        0 <= crop_x < crop.width
-        and 0 <= crop_y < crop.height
-    ):
-        selected_crop_pixel = (crop_x, crop_y)
-
-if selected_crop_pixel is not None:
-    st.write(
-        "Selected crop pixel: "
-        f"X = {selected_crop_pixel[0]:.1f}, "
-        f"Y = {selected_crop_pixel[1]:.1f}"
-    )
-
-    if st.button(
-        "Add target point",
-        type="primary",
-        key=f"add_target_{len(st.session_state.targets)}",
-    ):
-        # Store the point in original-image pixel coordinates.
-        original_point = (
-            x1 + selected_crop_pixel[0],
-            y1 + selected_crop_pixel[1],
-        )
-
-        st.session_state.targets.append(original_point)
-        st.session_state.last_target_click = None
-        st.rerun()
-
-if st.session_state.targets:
-    if st.button("Clear all target points"):
-        st.session_state.targets = []
-        st.session_state.last_target_click = None
-        st.rerun()
-
-
-# =========================================================
-# COORDINATE CONVERSION
-# =========================================================
-
-transform = make_transform(
-    box,
-    st.session_state.width_mm,
-    st.session_state.height_mm,
-)
-
-converted_points = []
-
-for index, point in enumerate(
-    st.session_state.targets,
-    start=1,
-):
-    x_mm, y_mm = pixel_to_mm(point, transform)
-
-    converted_points.append(
-        {
-            "Point": index,
-            "Image X (px)": round(point[0], 2),
-            "Image Y (px)": round(point[1], 2),
-            "X (mm)": round(x_mm, 3),
-            "Y (mm)": round(y_mm, 3),
-        }
-    )
+st.markdown("</div>", unsafe_allow_html=True)
 
 
 # =========================================================
 # RESULTS
 # =========================================================
 
-st.subheader("5. Coordinate results")
-
-if converted_points:
-    st.dataframe(
-        converted_points,
-        use_container_width=True,
-        hide_index=True,
+rows = []
+for i, p in enumerate(ss.points, start=1):
+    xm, ym = px_to_mm(p, ss.box, ss.width_mm, ss.height_mm)
+    rows.append(
+        {
+            "Point": i,
+            "X (mm)": round(xm, 3),
+            "Y (mm)": round(ym, 3),
+            "Image X (px)": round(p[0], 1),
+            "Image Y (px)": round(p[1], 1),
+        }
     )
+
+st.markdown('<div class="panel">', unsafe_allow_html=True)
+st.subheader("Coordinates")
+if rows:
+    last = rows[-1]
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Latest point", f"#{last['Point']}")
+    m2.metric("X", f"{last['X (mm)']:.3f} mm")
+    m3.metric("Y", f"{last['Y (mm)']:.3f} mm")
+    st.dataframe(rows, hide_index=True)
 else:
-    st.info("No target points selected yet.")
+    st.info("No points yet. Click a solder joint in the image above.")
+st.markdown("</div>", unsafe_allow_html=True)
 
 
 # =========================================================
-# G-CODE
+# EXPORT
 # =========================================================
 
-st.subheader("6. G-code preview")
+if rows:
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.subheader("Export")
+    st.caption(
+        "G-code contains XY moves only (no Z, no soldering action). "
+        "Coordinates are relative to the reference box, not your machine's home."
+    )
 
-st.caption(
-    "Only XY positioning is generated. No Z motion or soldering action "
-    "is included. These coordinates are relative to the selected box, "
-    "not automatically aligned to your machine's home position."
-)
-
-if converted_points:
-    gcode_lines = [
-        "; Solder Sight - generated XY points",
+    lines = [
+        "; Solder Sight - XY points (origin = bottom-left of reference box)",
         "; Review and validate before machine execution",
-        "G21 ; Units: millimetres",
-        "G90 ; Absolute positioning",
+        "G21 ; millimetres",
+        "G90 ; absolute positioning",
     ]
-
-    for point in converted_points:
-        gcode_lines.append(
-            f"G0 X{point['X (mm)']:.3f} Y{point['Y (mm)']:.3f}"
-        )
-
-    gcode_lines.append("M2 ; End program")
-    gcode = "\n".join(gcode_lines)
+    lines += [f"G0 X{r['X (mm)']:.3f} Y{r['Y (mm)']:.3f} ; point {r['Point']}" for r in rows]
+    lines.append("M2 ; end program")
+    gcode = "\n".join(lines)
 
     st.code(gcode, language="text")
 
-    st.download_button(
-        "Download G-code",
-        data=gcode,
-        file_name="solder_sight_points.gcode",
-        mime="text/plain",
-    )
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+    writer.writeheader()
+    writer.writerows(rows)
 
-    csv_data = "Point,Image X (px),Image Y (px),X (mm),Y (mm)\n"
-    for point in converted_points:
-        csv_data += (
-            f"{point['Point']},"
-            f"{point['Image X (px)']},"
-            f"{point['Image Y (px)']},"
-            f"{point['X (mm)']},"
-            f"{point['Y (mm)']}\n"
-        )
+    b1, b2 = st.columns(2)
+    b1.download_button("Download G-code", gcode, "solder_sight_points.gcode", "text/plain")
+    b2.download_button("Download CSV", buf.getvalue(), "solder_sight_coordinates.csv", "text/csv")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    st.download_button(
-        "Download coordinates CSV",
-        data=csv_data,
-        file_name="solder_sight_coordinates.csv",
-        mime="text/csv",
-    )
-
-st.divider()
 st.caption(
-    "Calibration accuracy depends on correct corner selection and "
-    "correct physical dimensions. This rectangular calibration is an "
-    "approximation if the real work area is not rectangular in the image. "
-    "Verify machine offsets, axis directions, limits, and safe movement "
-    "before using any coordinates."
+    "Accuracy depends on how precisely the box matches the real object and on "
+    "the camera facing the board straight on. Verify axis directions, offsets "
+    "and limits before using any coordinates on a machine."
 )
