@@ -4,7 +4,11 @@ Capture or upload a PCB image -> drag a reference box -> enter its real
 width/height -> click joints -> get X/Y in mm from the box's bottom-left corner.
 
 Install:
-    pip install streamlit pillow "streamlit-image-coordinates>=0.2.0"
+    pip install -r requirements.txt
+
+Auto-detection uses the Gemini API. Provide a key in the sidebar, in
+.streamlit/secrets.toml (GEMINI_API_KEY = "..."), or as the GEMINI_API_KEY
+environment variable.
 
 Run:
     streamlit run solder_sight.py
@@ -15,6 +19,9 @@ Camera note: browsers only allow camera access on https:// or http://localhost.
 import csv
 import hashlib
 import io
+import json
+import os
+import re
 
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
@@ -98,6 +105,7 @@ DEFAULTS = {
     "points": [],            # list of (x, y) in original image pixels
     "last_click_sig": None,
     "last_drag_sig": None,
+    "detect_msg": None,
 }
 for k, v in DEFAULTS.items():
     st.session_state.setdefault(k, v)
@@ -112,6 +120,7 @@ def reset_calibration():
     ss.points = []
     ss.last_click_sig = None
     ss.last_drag_sig = None
+    ss.detect_msg = None
 
 
 # =========================================================
@@ -166,6 +175,88 @@ def stepper(stage):
         html += f'<div class="step {cls}"><b>{i}. {title}</b>{sub}</div>'
     html += "</div>"
     st.markdown(html, unsafe_allow_html=True)
+
+
+DEFAULT_PROMPT = (
+    "Point to every solder joint on this PCB image. A solder joint is the "
+    "shiny or matte metal fillet where a component lead or pin meets a pad, "
+    "including through-hole pins and soldered SMD pads. Place each point at "
+    "the center of the joint. Do not point to bare unsoldered pads, vias, "
+    "silkscreen text, or component bodies."
+)
+
+
+def resolve_api_key(typed):
+    if typed and typed.strip():
+        return typed.strip()
+    try:
+        value = st.secrets.get("GEMINI_API_KEY")
+    except Exception:
+        value = None
+    return value or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+
+
+def detect_joints(crop, api_key, model, prompt, max_points):
+    """Ask Gemini for solder-joint points. Returns (x, y) in crop pixels."""
+    from google import genai
+    from google.genai import types
+
+    img = crop.copy()
+    img.thumbnail((1600, 1600))
+
+    full_prompt = (
+        f"{prompt}\n\nReturn at most {max_points} points. Answer ONLY with a "
+        'JSON list like [{"point": [y, x], "label": "short name"}] where y and '
+        "x are normalized to the range 0-1000 relative to this image."
+    )
+
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=model,
+        contents=[img, full_prompt],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.1,
+        ),
+    )
+
+    text = (response.text or "").strip()
+    text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
+    data = json.loads(text)
+    if isinstance(data, dict):
+        data = data.get("points") or data.get("items") or []
+
+    points = []
+    for item in data:
+        p = item.get("point") if isinstance(item, dict) else item
+        if not (isinstance(p, (list, tuple)) and len(p) == 2):
+            continue
+        y, x = float(p[0]), float(p[1])
+        if 0 <= x <= 1000 and 0 <= y <= 1000:
+            points.append((x / 1000 * crop.width, y / 1000 * crop.height))
+    return points[:max_points]
+
+
+def merge_points(existing, new, min_dist=8.0):
+    """Add new points, skipping any within min_dist px of an existing one."""
+    merged = list(existing)
+    added = 0
+    for p in new:
+        if all((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 >= min_dist**2 for q in merged):
+            merged.append(p)
+            added += 1
+    return merged, added
+
+
+def order_points(points, start):
+    """Greedy nearest-neighbour order starting from `start`."""
+    remaining, ordered, cur = list(points), [], start
+    while remaining:
+        nxt = min(remaining, key=lambda p: (p[0] - cur[0]) ** 2 + (p[1] - cur[1]) ** 2)
+        ordered.append(nxt)
+        remaining.remove(nxt)
+        cur = nxt
+    return ordered
 
 
 # =========================================================
@@ -266,7 +357,27 @@ with st.sidebar:
     )
 
     st.divider()
+    st.subheader("Auto-detection")
+    api_key_input = st.text_input(
+        "Gemini API key",
+        type="password",
+        help="Or set GEMINI_API_KEY in .streamlit/secrets.toml or the environment.",
+    )
+    model_name = st.text_input("Model", value="gemini-2.5-flash")
+    max_points = st.number_input("Max points", 1, 500, 100)
+    detect_mode = st.radio("When detecting", ["Replace points", "Add to existing"])
+    optimize_order = st.checkbox("Order points to shorten travel", value=True)
+    with st.expander("Detection prompt"):
+        prompt_text = st.text_area("Prompt", DEFAULT_PROMPT, height=170, label_visibility="collapsed")
+    st.caption("The cropped reference area is sent to Google's Gemini API.")
+
+    st.divider()
     if ss.calibrated:
+        if ss.points:
+            del_n = st.selectbox("Delete point #", list(range(1, len(ss.points) + 1)))
+            if st.button("Delete selected point"):
+                ss.points.pop(del_n - 1)
+                st.rerun()
         if st.button("Undo last point", disabled=not ss.points):
             ss.points.pop()
             st.rerun()
@@ -371,12 +482,47 @@ if crop.width < 2 or crop.height < 2:
     st.stop()
 
 st.markdown('<div class="panel">', unsafe_allow_html=True)
-st.subheader("3. Pick solder joints")
+st.subheader("3. Find solder joints")
 st.markdown(
-    '<div class="hint">Click a joint to add it. Each click is measured in mm '
-    "from the bottom-left corner of the reference box (red origin marker).</div>",
+    '<div class="hint">Let Gemini find the joints automatically, then fix any '
+    "mistakes: click the image to add a missed joint, or delete a wrong one "
+    "from the sidebar. All positions are measured in mm from the bottom-left "
+    "corner of the reference box (red origin marker).</div>",
     unsafe_allow_html=True,
 )
+
+if ss.detect_msg:
+    st.success(ss.detect_msg)
+    ss.detect_msg = None
+
+if st.button("Detect solder joints with Gemini", type="primary"):
+    api_key = resolve_api_key(api_key_input)
+    if not api_key:
+        st.error("Add a Gemini API key in the sidebar (or set GEMINI_API_KEY) and try again.")
+    else:
+        found = None
+        with st.spinner("Gemini is looking for solder joints..."):
+            try:
+                found_crop = detect_joints(crop, api_key, model_name.strip(), prompt_text, int(max_points))
+                found = [(x1 + fx, y1 + fy) for fx, fy in found_crop]
+            except ImportError:
+                st.error("Missing package. Run: pip install google-genai")
+            except json.JSONDecodeError:
+                st.error("Gemini returned an unreadable answer. Try again or adjust the prompt.")
+            except Exception as exc:
+                st.error(f"Detection failed: {exc}")
+        if found is not None:
+            base = [] if detect_mode == "Replace points" else ss.points
+            merged, added = merge_points(base, found)
+            if optimize_order:
+                merged = order_points(merged, (x1, y2))
+            ss.points = merged
+            ss.last_click_sig = None
+            ss.detect_msg = (
+                f"Found {len(found)} joints, added {added}. "
+                f"{len(merged)} points in total. Review them below."
+            )
+            st.rerun()
 
 crop_panel, c_scale, c_ox, c_oy, c_dw, c_dh = fit_image(crop, PANEL_W, PANEL_H)
 d = ImageDraw.Draw(crop_panel, "RGBA")
