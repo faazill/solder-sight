@@ -1,32 +1,24 @@
 """
-Solder Sight
-Capture or upload a PCB image -> drag a reference box -> enter its real
-width/height -> click joints -> get X/Y in mm from the box's bottom-left corner.
+Solder Sight planner UI.
+Capture/upload a PCB image -> draw a reference box -> enter its real size ->
+detect or click solder joints -> export job.json for the machine runner.
 
-Install:
-    pip install -r requirements.txt
-
-Auto-detection uses the Gemini API. Provide a key in the sidebar, in
-.streamlit/secrets.toml (GEMINI_API_KEY = "..."), or as the GEMINI_API_KEY
-environment variable.
-
-Run:
-    streamlit run solder_sight.py
-
-Camera note: browsers only allow camera access on https:// or http://localhost.
+Run:  streamlit run app.py
+Camera access needs https:// or http://localhost.
 """
 
 import csv
 import hashlib
 import io
 import json
-import os
-import re
 
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 from streamlit_image_coordinates import streamlit_image_coordinates
 
+from solder_sight.detection import DEFAULT_PROMPT, detect_joints, resolve_api_key
+from solder_sight.geometry import merge_points, order_points, px_to_mm
+from solder_sight.job import Job
 
 # =========================================================
 # CONFIGURATION
@@ -155,14 +147,6 @@ def image_to_panel(x, y, scale, ox, oy):
     return x * scale + ox, y * scale + oy
 
 
-def px_to_mm(point, box, width_mm, height_mm):
-    """Origin = bottom-left of the reference box. X right, Y up."""
-    x1, y1, x2, y2 = box
-    x_mm = (point[0] - x1) / (x2 - x1) * width_mm
-    y_mm = (y2 - point[1]) / (y2 - y1) * height_mm
-    return x_mm, y_mm
-
-
 def stepper(stage):
     names = [
         ("Capture image", "Camera or file"),
@@ -177,86 +161,11 @@ def stepper(stage):
     st.markdown(html, unsafe_allow_html=True)
 
 
-DEFAULT_PROMPT = (
-    "Point to every solder joint on this PCB image. A solder joint is the "
-    "shiny or matte metal fillet where a component lead or pin meets a pad, "
-    "including through-hole pins and soldered SMD pads. Place each point at "
-    "the center of the joint. Do not point to bare unsoldered pads, vias, "
-    "silkscreen text, or component bodies."
-)
-
-
-def resolve_api_key(typed):
-    if typed and typed.strip():
-        return typed.strip()
+def secret_key():
     try:
-        value = st.secrets.get("GEMINI_API_KEY")
+        return st.secrets.get("GEMINI_API_KEY")
     except Exception:
-        value = None
-    return value or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-
-
-def detect_joints(crop, api_key, model, prompt, max_points):
-    """Ask Gemini for solder-joint points. Returns (x, y) in crop pixels."""
-    from google import genai
-    from google.genai import types
-
-    img = crop.copy()
-    img.thumbnail((1600, 1600))
-
-    full_prompt = (
-        f"{prompt}\n\nReturn at most {max_points} points. Answer ONLY with a "
-        'JSON list like [{"point": [y, x], "label": "short name"}] where y and '
-        "x are normalized to the range 0-1000 relative to this image."
-    )
-
-    client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model,
-        contents=[img, full_prompt],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.1,
-        ),
-    )
-
-    text = (response.text or "").strip()
-    text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
-    data = json.loads(text)
-    if isinstance(data, dict):
-        data = data.get("points") or data.get("items") or []
-
-    points = []
-    for item in data:
-        p = item.get("point") if isinstance(item, dict) else item
-        if not (isinstance(p, (list, tuple)) and len(p) == 2):
-            continue
-        y, x = float(p[0]), float(p[1])
-        if 0 <= x <= 1000 and 0 <= y <= 1000:
-            points.append((x / 1000 * crop.width, y / 1000 * crop.height))
-    return points[:max_points]
-
-
-def merge_points(existing, new, min_dist=8.0):
-    """Add new points, skipping any within min_dist px of an existing one."""
-    merged = list(existing)
-    added = 0
-    for p in new:
-        if all((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 >= min_dist**2 for q in merged):
-            merged.append(p)
-            added += 1
-    return merged, added
-
-
-def order_points(points, start):
-    """Greedy nearest-neighbour order starting from `start`."""
-    remaining, ordered, cur = list(points), [], start
-    while remaining:
-        nxt = min(remaining, key=lambda p: (p[0] - cur[0]) ** 2 + (p[1] - cur[1]) ** 2)
-        ordered.append(nxt)
-        remaining.remove(nxt)
-        cur = nxt
-    return ordered
+        return None
 
 
 # =========================================================
@@ -496,7 +405,7 @@ if ss.detect_msg:
     ss.detect_msg = None
 
 if st.button("Detect solder joints with Gemini", type="primary"):
-    api_key = resolve_api_key(api_key_input)
+    api_key = resolve_api_key(api_key_input, secret_key())
     if not api_key:
         st.error("Add a Gemini API key in the sidebar (or set GEMINI_API_KEY) and try again.")
     else:
@@ -622,9 +531,13 @@ if rows:
     writer.writeheader()
     writer.writerows(rows)
 
-    b1, b2 = st.columns(2)
+    b1, b2, b3 = st.columns(3)
     b1.download_button("Download G-code", gcode, "solder_sight_points.gcode", "text/plain")
     b2.download_button("Download CSV", buf.getvalue(), "solder_sight_coordinates.csv", "text/csv")
+    job = Job.from_points(
+        [(r["X (mm)"], r["Y (mm)"]) for r in rows], ss.width_mm, ss.height_mm, ss.box
+    )
+    b3.download_button("Download job.json (for the runner)", job.to_json(), "job.json", "application/json")
     st.markdown("</div>", unsafe_allow_html=True)
 
 st.caption(
