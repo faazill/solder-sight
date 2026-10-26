@@ -22,19 +22,19 @@ streamlit run app.py
 Download `job.json` from the app's Export section, then:
 
 ```bash
-cp config/machine.example.yaml config/machine.yaml     # edit for your machine
-python -m solder_sight.cli job.json -c config/machine.yaml                  # DRY RUN (default)
-python -m solder_sight.cli job.json -c config/machine.yaml --image board.png  # dry run, no camera
-python -m solder_sight.cli job.json -c config/machine.yaml --live             # real machine
+cp machine.example.yaml machine.yaml     # edit for your machine
+python cli.py job.json -c machine.yaml                  # DRY RUN (default)
+python cli.py job.json -c machine.yaml --image board.png  # dry run, no camera
+python cli.py job.json -c machine.yaml --live             # real machine
 ```
 
 Each run saves before/after crops and `results.csv` under `runs/`.
 
 ## Gemini API key (optional, for auto-detection)
 
-Paste it in the sidebar, or copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`, or set
+Paste it in the sidebar, or copy `secrets.toml.example` to `.streamlit/secrets.toml`, or set
 `GEMINI_API_KEY`. Never commit it. The cropped board image is sent to Google's API.
-Prefer open source? See `solder_sight/detection.py`; add a backend there (YOLO, Molmo, Grounding DINO).
+Prefer open source? See `detection.py`; add a backend there (YOLO, Molmo, Grounding DINO).
 
 ## Machine setup checklist
 
@@ -60,12 +60,17 @@ ruff check . && pytest -q
 
 ## Layout
 
+All files live in one folder:
+
 ```
-app.py                 planner UI (Streamlit)
-solder_sight/          geometry, detection, job, machine, camera, inspection, runner, cli
-config/                machine.example.yaml
-docs/ARCHITECTURE.md   design and safety notes
-tests/                 pytest suite (runs without hardware)
+app.py                  planner UI (Streamlit)
+cli.py                  machine runner (command line)
+geometry.py  detection.py  job.py  config.py
+machine.py  camera.py  inspection.py  runner.py
+machine.example.yaml    machine settings template
+secrets.toml.example    Gemini key template
+test_*.py               tests (run without hardware)
+ARCHITECTURE.md         design and safety notes
 ```
 
 ## License

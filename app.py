@@ -16,9 +16,9 @@ import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 from streamlit_image_coordinates import streamlit_image_coordinates
 
-from solder_sight.detection import DEFAULT_PROMPT, detect_joints, resolve_api_key
-from solder_sight.geometry import merge_points, order_points, px_to_mm
-from solder_sight.job import Job
+from detection import DEFAULT_PROMPT, detect_joints, resolve_api_key
+from geometry import merge_points, order_points, px_to_mm
+from job import Job
 
 # =========================================================
 # CONFIGURATION
