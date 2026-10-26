@@ -1,0 +1,8 @@
+# Enough to run the tests and lint (no Streamlit / Gemini needed)
+pillow>=10.1
+opencv-python-headless>=4.9
+numpy>=1.26
+pyserial>=3.5
+pyyaml>=6.0
+pytest>=8.0
+ruff>=0.6
